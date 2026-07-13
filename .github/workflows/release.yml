@@ -33,12 +33,12 @@ jobs:
       DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "22.18.0"
 
@@ -47,7 +47,7 @@ jobs:
         run: corepack enable
 
       - name: Set up Python (castLabs EVS VMP signer)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -122,7 +122,7 @@ jobs:
         run: ls -la apps/desktop/dist
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: amp-windows-installer
           path: apps/desktop/dist/*.exe
