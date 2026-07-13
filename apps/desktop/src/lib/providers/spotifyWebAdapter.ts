@@ -442,6 +442,8 @@ export class SpotifyWebAdapter extends SpotifyBaseAdapter {
       return;
     }
     this.endedEmitted = true;
+    this.isActive = false;
+    this.currentUri = undefined;
     this.stopWatchdog();
     this.emit({
       type: "ended",

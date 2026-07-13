@@ -31,6 +31,7 @@ export interface DesktopConfig {
   spotifyClientId: string;
   soundCloudClientId: string;
   soundCloudClientSecret: string;
+  soundCloudClientSecretConfigured: boolean;
 }
 
 export interface StoredProviderSessionStatus {
@@ -165,7 +166,8 @@ export async function getDesktopConfig(): Promise<DesktopConfig> {
     return {
       spotifyClientId: "",
       soundCloudClientId: "",
-      soundCloudClientSecret: ""
+      soundCloudClientSecret: "",
+      soundCloudClientSecretConfigured: false
     };
   }
 
@@ -572,37 +574,6 @@ export async function cancelConnectDesktopProvider(provider: Provider): Promise<
     return;
   }
   await window.spotCloud!.oauth.cancelConnect(provider).catch(() => undefined);
-}
-
-export interface NodeLicenseRequest {
-  psshBase64: string;
-  licenseUrl: string;
-  licenseAuthToken?: string;
-  privateKeyPath: string;
-  identifierBlobPath: string;
-}
-
-export interface NodeLicenseResult {
-  ok: boolean;
-  status: number;
-  keyCount: number;
-  keys?: Array<{ key: string; type: string; kid?: string }>;
-  error?: string;
-  serviceCertOk: boolean;
-}
-
-export async function widevineNodeLicense(request: NodeLicenseRequest): Promise<NodeLicenseResult> {
-  if (!hasDesktopBridge()) {
-    return {
-      ok: false,
-      status: -1,
-      keyCount: 0,
-      serviceCertOk: false,
-      error: "Node-widevine license requires the Electron main process."
-    };
-  }
-
-  return window.spotCloud!.drm.widevineNodeLicense(request) as Promise<NodeLicenseResult>;
 }
 
 export interface WidevineStatus {

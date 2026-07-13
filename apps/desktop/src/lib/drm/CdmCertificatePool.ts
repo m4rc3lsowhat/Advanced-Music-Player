@@ -160,7 +160,8 @@ export class CdmCertificatePool {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: request as BufferSource,
-      credentials: "include"
+      credentials: "include",
+      signal: AbortSignal.timeout(15_000)
     });
 
     if (!response.ok) {
@@ -168,7 +169,14 @@ export class CdmCertificatePool {
       return [];
     }
 
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > 1024 * 1024) {
+      throw new Error("Service certificate response was too large.");
+    }
     const raw = new Uint8Array(await response.arrayBuffer());
+    if (raw.length > 1024 * 1024) {
+      throw new Error("Service certificate response was too large.");
+    }
     drmLog(`service-cert response: ${raw.length} bytes head=${hexHead(raw, 6)}`);
     if (raw.length < 8) {
       // Too small to be a certificate (likely an error blob).

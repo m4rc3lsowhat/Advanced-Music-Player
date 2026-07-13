@@ -237,7 +237,11 @@ function readCookiesOverWebSocket(webSocketUrl: string): Promise<RemoteCookie[]>
           const deadline = Date.now() + 12_000;
           let best: RemoteCookie[] = [];
           while (Date.now() < deadline && !settled) {
-            const result = (await send("Network.getAllCookies", {}, attached.sessionId)) as {
+            const result = (await send(
+              "Network.getCookies",
+              { urls: ["https://soundcloud.com/", "https://api-v2.soundcloud.com/"] },
+              attached.sessionId
+            )) as {
               cookies?: RemoteCookie[];
             };
             const cookies = result.cookies ?? [];
@@ -247,7 +251,7 @@ function readCookiesOverWebSocket(webSocketUrl: string): Promise<RemoteCookie[]>
             const hasAuthCookie = cookies.some(
               (cookie) =>
                 cookie.name === "oauth_token" &&
-                /soundcloud\.com$/i.test(cookie.domain ?? "") &&
+                /(^|\.)soundcloud\.com$/i.test(cookie.domain ?? "") &&
                 Boolean(cookie.value) &&
                 cookie.value.length > 8
             );
@@ -483,7 +487,15 @@ function pollForSoundCloudTokenOverWebSocket(
       };
       // Prefer a soundcloud tab; fall back to any page so we still read the shared cookie jar.
       const pages = (targets.targetInfos ?? []).filter((target) => target.type === "page");
-      const page = pages.find((target) => /soundcloud\.com/i.test(target.url)) ?? pages[0];
+      const page =
+        pages.find((target) => {
+          try {
+            const hostname = new URL(target.url).hostname;
+            return hostname === "soundcloud.com" || hostname.endsWith(".soundcloud.com");
+          } catch {
+            return false;
+          }
+        }) ?? pages[0];
       if (!page) {
         return false;
       }
@@ -522,14 +534,18 @@ function pollForSoundCloudTokenOverWebSocket(
                 if (!sessionId && !(await attachToPage())) {
                   return;
                 }
-                const result = (await send("Network.getAllCookies", {}, sessionId)) as {
+                const result = (await send(
+                  "Network.getCookies",
+                  { urls: ["https://soundcloud.com/", "https://api-v2.soundcloud.com/"] },
+                  sessionId
+                )) as {
                   cookies?: RemoteCookie[];
                 };
                 const cookies = result.cookies ?? [];
                 const auth = cookies.find(
                   (cookie) =>
                     cookie.name === "oauth_token" &&
-                    /soundcloud\.com$/i.test(cookie.domain ?? "") &&
+                    /(^|\.)soundcloud\.com$/i.test(cookie.domain ?? "") &&
                     Boolean(cookie.value) &&
                     cookie.value.length > 8
                 );

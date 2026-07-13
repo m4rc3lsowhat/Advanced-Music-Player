@@ -10,7 +10,6 @@ const outputPath = path.join(desktopRoot, "dist-electron", "bundled-desktop-conf
 const managedKeys = [
   "SPOTIFY_CLIENT_ID",
   "SOUNDCLOUD_CLIENT_ID",
-  "SOUNDCLOUD_CLIENT_SECRET",
   "DISCORD_CLIENT_ID"
 ];
 

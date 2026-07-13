@@ -429,7 +429,9 @@ export class SpotifyPartnerGateway {
           })
         });
 
-        if (response.status !== 200) break;
+        if (response.status !== 200) {
+          throw new Error(`Spotify saved tracks returned ${response.status}.`);
+        }
 
         const json = JSON.parse(response.body) as SpotifyPartnerLibraryResponse;
         const items =

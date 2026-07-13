@@ -30,13 +30,11 @@ import type Hls from "hls.js";
 import { WidevineDrmEngine, type DrmLicenseConfig, type DrmInitData, type DrmEngineEvent } from "./WidevineDrmEngine";
 import { deviceIdentityManager } from "./DeviceIdentity";
 import { globalCertPool } from "./CdmCertificatePool";
-import { widevineNodeLicense } from "../desktopBridge";
 
 export type FallbackStage =
   | "progressive"
   | "plain-hls"
   | "widevine-manual-eme"
-  | "node-widevine"
   | "widevine-hlsjs-eme"
   | "widget"
   | "failed";
@@ -106,7 +104,7 @@ function writeDrmPref(stage: FallbackStage): void {
 
 function fallbackLog(stage: FallbackStage, message: string, ...rest: unknown[]): void {
   try {
-    if (globalThis.localStorage?.getItem("sc.drm.debug") === "0") return;
+    if (globalThis.localStorage?.getItem("sc.drm.debug") !== "1") return;
   } catch {
     // ignore
   }
@@ -128,7 +126,7 @@ export class DrmFallbackChain {
 
   private logEngineEvent(event: DrmEngineEvent): void {
     try {
-      if (globalThis.localStorage?.getItem("sc.drm.debug") === "0") return;
+      if (globalThis.localStorage?.getItem("sc.drm.debug") !== "1") return;
     } catch {
       // ignore
     }
@@ -152,7 +150,7 @@ export class DrmFallbackChain {
         console.log(`[SC DRM] license-ok size=${event.size}`);
         break;
       case "license-failed":
-        console.error(`[SC DRM] license-failed status=${event.status} body=${event.body}`);
+        console.error(`[SC DRM] license-failed status=${event.status}`);
         break;
       case "session-update-failed":
         console.error(`[SC DRM] session-update-failed: ${event.error}`);
@@ -268,7 +266,7 @@ export class DrmFallbackChain {
         const pssh = this.extractPsshFromMp4(initSegment);
         fallbackLog(
           "widevine-manual-eme",
-          `pssh=${pssh ? pssh.byteLength + "b" : "none"} licenseUrl=${drmConfig.licenseUrl} token=${drmConfig.licenseAuthToken ? "present" : "MISSING"} trackAuth=${drmConfig.trackAuthorization ? "present" : "MISSING"}`
+          `pssh=${pssh ? pssh.byteLength + "b" : "none"} licenseHost=${new URL(drmConfig.licenseUrl).host} token=${drmConfig.licenseAuthToken ? "present" : "MISSING"} trackAuth=${drmConfig.trackAuthorization ? "present" : "MISSING"}`
         );
         if (pssh) {
           const result = await this.engine.acquireLicense(drmConfig, { pssh, initSegment });
@@ -289,12 +287,6 @@ export class DrmFallbackChain {
         fallbackLog("widevine-manual-eme", "Failed:", (error as Error)?.message);
         this.engine.abort();
       }
-    }
-
-    // 3b) Node-widevine diagnostic: test whether KeyOS accepts a custom device identity.
-    // This is fire-and-forget — it never blocks playback, but logs the decisive 200/403.
-    if (drmConfig && initSegment) {
-      void this.probeNodeWidevineLicense(drmConfig, initSegment);
     }
 
     // 4) Widevine via hls.js built-in EME
@@ -431,11 +423,6 @@ export class DrmFallbackChain {
       drmSystems: {
         "com.widevine.alpha": {
           licenseUrl: drm.licenseUrl,
-          serverCertificateUrl: (() => {
-            const u = new URL(drm.licenseUrl);
-            u.search = "";
-            return u.toString();
-          })()
         }
       },
       licenseXhrSetup: (xhr, licenseUrl) => {
@@ -545,63 +532,4 @@ export class DrmFallbackChain {
     return parseBoxes(new DataView(buffer), 0, buffer.byteLength);
   }
 
-  /**
-   * Diagnostic probe: use a custom Widevine device (@spdl/widevine in the main process)
-   * to request a license from SoundCloud's KeyOS server. This proves whether the 403
-   * is caused by the castLabs CDM device identity or something else.
-   *
-   * Fire-and-forget: the result is logged but does not affect the fallback chain.
-   */
-  private async probeNodeWidevineLicense(
-    drmConfig: DrmLicenseConfig,
-    initSegment: ArrayBuffer
-  ): Promise<void> {
-    try {
-      const pssh = this.extractPsshFromMp4(initSegment);
-      if (!pssh) {
-        fallbackLog("node-widevine", "No PSSH found in init segment; skipping probe.");
-        return;
-      }
-      const psshBase64 = btoa(
-        Array.from(new Uint8Array(pssh))
-          .map((b) => String.fromCharCode(b))
-          .join("")
-      );
-
-      // Default device path: userData/widevine/ (user must place files there)
-      // Ask the main process for the real userData path so we don't hardcode.
-      const { getRuntimeInfo } = await import("../desktopBridge");
-      const runtime = await getRuntimeInfo();
-      const deviceDir = `${runtime.configDirectory}/widevine`;
-      const privateKeyPath = `${deviceDir}/device_private_key`;
-      const identifierBlobPath = `${deviceDir}/device_client_id_blob`;
-
-      fallbackLog(
-        "node-widevine",
-        `Probing KeyOS with custom device… paths=${privateKeyPath},${identifierBlobPath}`
-      );
-
-      const result = await widevineNodeLicense({
-        psshBase64,
-        licenseUrl: drmConfig.licenseUrl,
-        licenseAuthToken: drmConfig.licenseAuthToken,
-        privateKeyPath,
-        identifierBlobPath
-      });
-
-      if (result.ok) {
-        fallbackLog(
-          "node-widevine",
-          `SUCCESS status=${result.status} keys=${result.keyCount} serviceCert=${result.serviceCertOk}`
-        );
-      } else {
-        fallbackLog(
-          "node-widevine",
-          `FAILED status=${result.status} error=${result.error} serviceCert=${result.serviceCertOk}`
-        );
-      }
-    } catch (error) {
-      fallbackLog("node-widevine", "Probe error:", (error as Error)?.message);
-    }
-  }
 }

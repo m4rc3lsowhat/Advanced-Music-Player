@@ -15,6 +15,8 @@ const OP_PONG = 4;
 
 const RECONNECT_DELAY_MS = 15_000;
 const CONNECT_TIMEOUT_MS = 2_000;
+const MAX_FRAME_BYTES = 256 * 1024;
+const MAX_BUFFER_BYTES = 512 * 1024;
 
 /** A music-listening activity to show on the user's Discord profile. */
 export interface DiscordActivity {
@@ -157,7 +159,11 @@ export class DiscordPresenceClient {
       socket.on("data", (chunk) => {
         const data = typeof chunk === "string" ? Buffer.from(chunk, "binary") : chunk;
         this.buffer = Buffer.concat([this.buffer, data]);
-        this.drainFrames((op, payload) => {
+        if (this.buffer.length > MAX_BUFFER_BYTES) {
+          socket.destroy();
+          return;
+        }
+        const valid = this.drainFrames((op, payload) => {
           if (op === OP_PING) {
             this.write(OP_PONG, payload);
             return;
@@ -172,10 +178,15 @@ export class DiscordPresenceClient {
             finish(true);
           }
         });
+        if (!valid) {
+          socket.destroy();
+        }
       });
 
       const onGone = () => {
-        this.onDisconnect();
+        if (this.socket === socket) {
+          this.onDisconnect();
+        }
         finish(false);
       };
       socket.on("error", onGone);
@@ -183,10 +194,14 @@ export class DiscordPresenceClient {
     });
   }
 
-  private drainFrames(handle: (op: number, payload: { evt?: string } | undefined) => void): void {
+  private drainFrames(handle: (op: number, payload: { evt?: string } | undefined) => void): boolean {
     while (this.buffer.length >= 8) {
-      const op = this.buffer.readInt32LE(0);
-      const length = this.buffer.readInt32LE(4);
+      const op = this.buffer.readUInt32LE(0);
+      const length = this.buffer.readUInt32LE(4);
+      if (length > MAX_FRAME_BYTES) {
+        this.buffer = Buffer.alloc(0);
+        return false;
+      }
       if (this.buffer.length < 8 + length) {
         break;
       }
@@ -200,6 +215,7 @@ export class DiscordPresenceClient {
       }
       handle(op, payload);
     }
+    return true;
   }
 
   private write(op: number, data: unknown): void {
@@ -208,8 +224,8 @@ export class DiscordPresenceClient {
     }
     const json = Buffer.from(JSON.stringify(data), "utf8");
     const header = Buffer.alloc(8);
-    header.writeInt32LE(op, 0);
-    header.writeInt32LE(json.length, 4);
+    header.writeUInt32LE(op, 0);
+    header.writeUInt32LE(json.length, 4);
     try {
       this.socket.write(Buffer.concat([header, json]));
     } catch {
@@ -255,7 +271,7 @@ export class DiscordPresenceClient {
       rpc.state = state;
     }
     if (activity.startTimestamp) {
-      rpc.timestamps = { start: Math.floor(activity.startTimestamp) };
+      rpc.timestamps = { start: Math.floor(activity.startTimestamp / 1_000) };
     }
     if (Object.keys(assets).length > 0) {
       rpc.assets = assets;

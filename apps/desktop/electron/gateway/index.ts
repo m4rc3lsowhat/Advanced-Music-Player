@@ -25,8 +25,6 @@ export class ProviderGateway {
 
   async initialize(): Promise<void> {
     await this.cache.initialize();
-    // YouTube warm-up is fire-and-forget: PO-token generation is slow and non-critical to boot.
-    void this.youtube.initialize();
     await Promise.all([this.spotify.initialize(), this.soundcloud.initialize()]);
   }
 
@@ -98,6 +96,10 @@ export class ProviderGateway {
     } else {
       this.cache.invalidate(new RegExp(`^${provider}:`));
     }
+  }
+
+  clearSoundCloudSession(): void {
+    this.soundcloud.clearSession();
   }
 
   private async handleSpotifyRequest(req: GatewayRequest): Promise<GatewayResponse> {

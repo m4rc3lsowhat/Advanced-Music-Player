@@ -36,9 +36,6 @@ If you already have an account, refresh the session instead:
 python -m castlabs_evs.account reauth
 ```
 
-> In this Claude Code session you can run these yourself with the `!` prefix
-> (e.g. `! python -m castlabs_evs.account signup`) so the output lands in the transcript.
-
 Convenience wrappers are wired in `package.json`:
 
 ```bash
@@ -121,6 +118,5 @@ Expect `PASS — N signature file(s) total. Build is VMP-signed.`
 
 ## Scope / boundaries
 
-The supported solution is **production VMP signing only** — keys never leave the CDM. The
-`@spdl/widevine` + extracted-device-key probe in `electron/drm/WidevineNodeSession.ts` is a
-circumvention experiment and is **not** part of this path; do not extend it.
+The supported solution is **production VMP signing only** — keys never leave the CDM. Raw-key or
+extracted-device-key probes are intentionally not shipped and are outside this path.

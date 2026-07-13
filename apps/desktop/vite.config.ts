@@ -17,14 +17,7 @@ export default defineConfig({
               // Node/native-ish deps that must resolve from node_modules at runtime, not be bundled.
               // youtubei.js powers YouTube search; music-metadata reads local file tags. The
               // packaged build ships the prod-dep closure so these resolve.
-              external: [
-                "@spdl/widevine",
-                "protobufjs",
-                "protobufjs/minimal",
-                "protobufjs/minimal.js",
-                "youtubei.js",
-                "music-metadata"
-              ]
+              external: ["youtubei.js", "music-metadata"]
             }
           }
         }

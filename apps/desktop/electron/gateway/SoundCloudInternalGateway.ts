@@ -12,6 +12,7 @@ import type { GatewayResponse } from "./types";
 import { StealthClient } from "./StealthClient";
 import { resolveMediaInPage, probeNativePlaybackOnce } from "../SoundCloudResolverWindow";
 import { appendFileSync, statSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -32,6 +33,14 @@ function logResolve(message: string, data?: unknown): void {
     appendFileSync(RESOLVE_LOG_PATH, line, "utf8");
   } catch {
     // ignore
+  }
+}
+
+function parseJsonBody<T>(body: string): T | undefined {
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    return undefined;
   }
 }
 
@@ -181,6 +190,12 @@ export class SoundCloudInternalGateway {
 
   async initialize(): Promise<void> {
     await this.ensureAssetBundle();
+  }
+
+  clearSession(): void {
+    this.soundCloudOAuthToken = undefined;
+    this.authenticatedUserIds.clear();
+    this.cache.invalidate(/^soundcloud:/);
   }
 
   /** The current scraped public client_id — needed for in-page api-v2 calls (e.g. the like window). */
@@ -395,7 +410,8 @@ export class SoundCloudInternalGateway {
           streamUrl.searchParams.set("client_id", bundle.clientId);
           const response = await this.client.request(streamUrl.toString(), {
             method: "GET",
-            headers: authHeaders
+            headers: authHeaders,
+            redirect: "manual"
           });
           logResolve("resolveStream try stream_url", {
             title: track.title,
@@ -404,7 +420,7 @@ export class SoundCloudInternalGateway {
           });
           if (response.status >= 300 && response.status < 400 && response.headers["location"]) {
             const result: SoundCloudStreamResult = { url: response.headers["location"] };
-            this.cache.set(cacheKey, result, STREAM_CACHE_TTL_MS);
+            this.cache.setMemoryOnly(cacheKey, result, STREAM_CACHE_TTL_MS);
             logResolve("resolveStream SUCCESS stream_url", { title: track.title, url: result.url.slice(0, 120) });
             return { ok: true, data: result, source: "internal" };
           }
@@ -422,23 +438,23 @@ export class SoundCloudInternalGateway {
           method: "GET",
           headers: authHeaders
         });
+        const json = parseJsonBody<SoundCloudInternalStreamResponse>(response.body);
         logResolve("resolveStream try plain", {
           title: track.title,
           protocol: transcoding.format?.protocol,
           preset: transcoding.preset,
           status: response.status,
-          hasUrl: !!JSON.parse(response.body ?? "{}").url
+          hasUrl: !!json?.url
         });
         if (!this.isSuccessStatus(response.status)) {
           lastStatus = response.status;
           continue;
         }
-        const json = JSON.parse(response.body) as SoundCloudInternalStreamResponse;
-        if (!json.url) {
+        if (!json?.url) {
           continue;
         }
         const result: SoundCloudStreamResult = { url: json.url };
-        this.cache.set(cacheKey, result, STREAM_CACHE_TTL_MS);
+        this.cache.setMemoryOnly(cacheKey, result, STREAM_CACHE_TTL_MS);
         logResolve("resolveStream SUCCESS plain", { title: track.title, url: json.url.slice(0, 120) });
         return { ok: true, data: result, source: "internal" };
       }
@@ -464,6 +480,7 @@ export class SoundCloudInternalGateway {
           });
           response = await this.client.request(mediaUrl, { method: "GET", headers: authHeaders });
         }
+        const json = parseJsonBody<SoundCloudInternalStreamResponse>(response.body);
         // One-shot diagnostic (fire-and-forget): let SoundCloud's own player attempt this track in a
         // hidden window, so we can observe whether the genuine license POST 200s or 403s in our
         // (Electron + castLabs CDM) environment — the decisive castLabs-vs-context signal.
@@ -471,12 +488,11 @@ export class SoundCloudInternalGateway {
         logResolve("resolveStream try drm", {
           title: track.title,
           status: response.status,
-          hasUrl: !!JSON.parse(response.body ?? "{}").url,
-          hasLicenseToken: !!JSON.parse(response.body ?? "{}").licenseAuthToken
+          hasUrl: !!json?.url,
+          hasLicenseToken: !!json?.licenseAuthToken
         });
         if (this.isSuccessStatus(response.status)) {
-          const json = JSON.parse(response.body) as SoundCloudInternalStreamResponse;
-          if (json.url) {
+          if (json?.url) {
             const result: SoundCloudStreamResult = {
               url: json.url,
               drm: {
@@ -487,7 +503,7 @@ export class SoundCloudInternalGateway {
                 trackAuthorization: trackData.track_authorization
               }
             };
-            this.cache.set(cacheKey, result, STREAM_CACHE_TTL_MS);
+            this.cache.setMemoryOnly(cacheKey, result, STREAM_CACHE_TTL_MS);
             logResolve("resolveStream SUCCESS drm", { title: track.title, url: json.url.slice(0, 120) });
             return { ok: true, data: result, source: "internal" };
           }
@@ -722,9 +738,17 @@ export class SoundCloudInternalGateway {
   ): Promise<T[]> {
     const items: T[] = [];
     let nextUrl: string | undefined = `${SOUNDCLOUD_PUBLIC_API_BASE}${path}`;
+    const visited = new Set<string>();
 
     while (nextUrl && items.length < cap) {
+      if (visited.has(nextUrl) || visited.size >= 100) {
+        throw new Error("SoundCloud pagination returned a cycle or too many pages.");
+      }
+      visited.add(nextUrl);
       const url = new URL(nextUrl);
+      if (url.protocol !== "https:" || url.hostname !== "api-v2.soundcloud.com") {
+        throw new Error("SoundCloud pagination returned an untrusted URL.");
+      }
       url.searchParams.set("client_id", bundle.clientId);
       url.searchParams.set("app_version", bundle.appVersion);
       url.searchParams.set("app_locale", bundle.appLocale);
@@ -734,7 +758,7 @@ export class SoundCloudInternalGateway {
         headers: { Accept: "application/json", ...(authHeaders ?? {}) }
       });
       if (!this.isSuccessStatus(response.status)) {
-        break;
+        throw new Error(`SoundCloud pagination returned ${response.status}.`);
       }
 
       const json = JSON.parse(response.body) as SoundCloudInternalPaginatedResponse<T>;
@@ -753,11 +777,15 @@ export class SoundCloudInternalGateway {
   async resolveAuthenticatedProfile(oauthToken: string): Promise<GatewayResponse<SoundCloudProfileResultDTO>> {
     try {
       // Remember the signed-in token so stream resolution can authenticate monetized tracks.
+      if (this.soundCloudOAuthToken !== oauthToken) {
+        this.clearSession();
+      }
       this.soundCloudOAuthToken = oauthToken;
       const bundle = await this.ensureAssetBundle();
       const authHeaders = { Authorization: `OAuth ${oauthToken}` };
 
-      const cacheKey = `soundcloud:me-library:v4:${oauthToken.slice(-8)}`;
+      const accountCacheKey = createHash("sha256").update(oauthToken).digest("hex").slice(0, 16);
+      const cacheKey = `soundcloud:me-library:v4:${accountCacheKey}`;
       const cached = this.cache.get<SoundCloudProfileResultDTO>(cacheKey);
       if (cached) {
         return { ok: true, data: cached, source: "cache" };
@@ -847,7 +875,7 @@ export class SoundCloudInternalGateway {
       );
 
       const data: SoundCloudProfileResultDTO = { displayName, likes, uploads, playlists, subscriptionTier };
-      this.cache.set(cacheKey, data, PROFILE_CACHE_TTL_MS);
+      this.cache.setMemoryOnly(cacheKey, data, PROFILE_CACHE_TTL_MS);
       return { ok: true, data, source: "internal" };
     } catch (error) {
       return {
@@ -1040,8 +1068,13 @@ export class SoundCloudInternalGateway {
   private async fetchPaginated<T>(path: string, accessToken: string): Promise<T[]> {
     const items: T[] = [];
     let nextUrl: string | undefined = path;
+    const visited = new Set<string>();
 
     while (nextUrl) {
+      if (visited.has(nextUrl) || visited.size >= 200) {
+        throw new Error("SoundCloud pagination returned a cycle or too many pages.");
+      }
+      visited.add(nextUrl);
       const response: SoundCloudInternalPaginatedResponse<T> = await this.authenticatedRequest(nextUrl, accessToken);
       items.push(...(response.collection ?? []));
       nextUrl = response.next_href;
@@ -1051,9 +1084,14 @@ export class SoundCloudInternalGateway {
   }
 
   private async authenticatedRequest<T>(pathOrUrl: string, accessToken: string): Promise<T> {
-    const url = pathOrUrl.startsWith("http") ? pathOrUrl : `https://api.soundcloud.com${pathOrUrl}`;
+    const url = new URL(
+      pathOrUrl.startsWith("http") ? pathOrUrl : `https://api.soundcloud.com${pathOrUrl}`
+    );
+    if (url.protocol !== "https:" || url.hostname !== "api.soundcloud.com") {
+      throw new Error("SoundCloud returned an untrusted API URL.");
+    }
 
-    const response = await this.client.request(url, {
+    const response = await this.client.request(url.toString(), {
       method: "GET",
       headers: {
         Authorization: `Bearer ${accessToken}`,

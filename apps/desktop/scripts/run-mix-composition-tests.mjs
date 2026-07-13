@@ -1,4 +1,7 @@
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { register } from "node:module";
+
+register("./_tsresolve.mjs", import.meta.url);
 
 const modPath = fileURLToPath(new URL("../src/lib/mixes/composition.ts", import.meta.url));
 const {
@@ -11,7 +14,7 @@ const {
   seededShuffle,
   interleave,
   buildDailyMixes,
-  buildStation
+  buildScoredStation
 } = await import(pathToFileURL(modPath).href);
 
 let failures = 0;
@@ -138,7 +141,13 @@ const stationPool = [
   track("spotify", "X"), track("spotify", "Y"), track("spotify", "Z"),
   track("soundcloud", "P"), track("soundcloud", "Q"), track("soundcloud", "R")
 ];
-const station = buildStation(seed, [...stationPool, seed], { size: 5 });
+const stationScores = new Map(
+  stationPool.map((candidate, index) => [trackKey(candidate), 100 - index])
+);
+const station = buildScoredStation(seed, [...stationPool, seed], stationScores, {
+  size: 5,
+  seedKey: trackKey(seed)
+});
 assert(station.tracks[0].title === "Slow", "station starts on the seed track");
 assert(station.tracks.length === 5, "station respects size cap");
 assert(
@@ -150,6 +159,21 @@ assert(
   "station blends both providers"
 );
 assert(station.kind === "station", "station kind is set");
+
+const blocked = track("soundcloud", "Artist Foreign", "Foreign Script");
+const gatedStation = buildScoredStation(
+  seed,
+  [stationPool[0], blocked],
+  new Map([
+    [trackKey(stationPool[0]), 2],
+    [trackKey(blocked), -12]
+  ]),
+  { size: 5 }
+);
+assert(
+  !gatedStation.tracks.some((candidate) => trackKey(candidate) === trackKey(blocked)),
+  "station assembly excludes negatively scored candidates"
+);
 
 if (failures === 0) {
   console.log("PASS: mix composition tests completed.");

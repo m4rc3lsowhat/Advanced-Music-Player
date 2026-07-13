@@ -9,12 +9,10 @@ function getBuildEnv(name: string): string | undefined {
 
 interface RuntimeEnvState {
   productName: string;
-  enableSelfHostSetup: boolean;
 }
 
 const runtimeEnv: RuntimeEnvState = {
-  productName: getBuildEnv("VITE_PRODUCT_NAME") ?? "AMP",
-  enableSelfHostSetup: getBuildEnv("VITE_ENABLE_SELF_HOST_SETUP") === "true"
+  productName: getBuildEnv("VITE_PRODUCT_NAME") ?? "AMP"
 };
 
 export function getAppEnv(): RuntimeEnvState {

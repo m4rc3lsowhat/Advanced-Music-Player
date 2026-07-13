@@ -700,11 +700,18 @@ export class SoundCloudPlaybackAdapter implements PlaybackAdapter {
     document.body.appendChild(iframe);
 
     const widget = widgetApi(iframe);
-    await this.waitForWidgetReady(widgetApi, widget);
-    this.resetWidgetEventBridge(widgetApi, widget);
-
     this.widgetIframe = iframe;
-    return widget;
+    this.widget = widget;
+    try {
+      await this.waitForWidgetReady(widgetApi, widget);
+      this.resetWidgetEventBridge(widgetApi, widget);
+      return widget;
+    } catch (error) {
+      if (this.widget === widget) {
+        this.destroyWidget();
+      }
+      throw error;
+    }
   }
 
   /**
@@ -781,13 +788,21 @@ export class SoundCloudPlaybackAdapter implements PlaybackAdapter {
     widget: SoundCloudWidgetController
   ): Promise<void> {
     await new Promise<void>((resolve, reject) => {
+      const settle = (error?: Error) => {
+        window.clearTimeout(timeout);
+        widget.unbind(widgetApi.Events.READY);
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
       const timeout = window.setTimeout(() => {
-        reject(new Error("SoundCloud widget playback did not finish loading."));
+        settle(new Error("SoundCloud widget playback did not finish loading."));
       }, 12_000);
 
       widget.bind(widgetApi.Events.READY, () => {
-        window.clearTimeout(timeout);
-        resolve();
+        settle();
       });
     });
   }
@@ -1134,6 +1149,15 @@ export class SoundCloudPlaybackAdapter implements PlaybackAdapter {
 
   private destroyWidget(): void {
     this.stopWidgetEndPolling();
+    const widget = this.widget;
+    const events = window.SC?.Widget?.Events;
+    if (widget && events) {
+      for (const event of [events.READY, events.PLAY, events.PAUSE, events.FINISH, events.PLAY_PROGRESS, events.ERROR]) {
+        if (event) {
+          widget.unbind(event);
+        }
+      }
+    }
     this.widget = undefined;
     this.widgetTrackUrl = undefined;
 

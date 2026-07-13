@@ -117,6 +117,7 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
   protected artistTopTracksCache = new Map<string, CachedValue<UnifiedTrack[]>>();
   protected artistAlbumsCache = new Map<string, CachedValue<SpotifyAlbumSummary[]>>();
   protected albumCache = new Map<string, CachedValue<SpotifyAlbumDetail>>();
+  private rateLimitedUntil = 0;
   protected snapshot: PlaybackAdapterSnapshot = {
     provider: "spotify",
     status: "idle",
@@ -136,6 +137,16 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
     return () => {
       this.listeners.delete(listener);
     };
+  }
+
+  clearAccountCaches(): void {
+    this.searchCache.clear();
+    this.collectionsCache = undefined;
+    this.collectionTrackCache.clear();
+    this.artistCache.clear();
+    this.artistTopTracksCache.clear();
+    this.artistAlbumsCache.clear();
+    this.albumCache.clear();
   }
 
   // ---- Playback transport — implemented per engine ----
@@ -191,9 +202,18 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
     }
 
     try {
-      const playlistResponse = await this.request("/me/playlists?limit=50");
-      if (playlistResponse.ok) {
-        const playlistJson = (await playlistResponse.json()) as { items?: SpotifyApiPlaylist[] };
+      let nextUrl: string | undefined = "/me/playlists?limit=50";
+      const visited = new Set<string>();
+      while (nextUrl && !visited.has(nextUrl) && visited.size < 20) {
+        visited.add(nextUrl);
+        const playlistResponse = await this.request(nextUrl);
+        if (!playlistResponse.ok) {
+          break;
+        }
+        const playlistJson = (await playlistResponse.json()) as {
+          items?: SpotifyApiPlaylist[];
+          next?: string | null;
+        };
         for (const playlist of playlistJson.items ?? []) {
           if (!playlist.id) {
             continue;
@@ -210,6 +230,7 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
             ownerName: playlist.owner?.display_name
           });
         }
+        nextUrl = playlistJson.next ?? undefined;
       }
     } catch {
       // Playlists are best-effort.
@@ -238,13 +259,21 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
       const apiTracks: SpotifyApiTrack[] = [];
       let nextUrl: string | undefined = "/me/tracks?limit=50";
       let page = 0;
+      const visitedPages = new Set<string>();
       while (nextUrl) {
+        if (page >= 400 || visitedPages.has(nextUrl)) {
+          throw new Error("Spotify returned an invalid Liked Songs pagination cursor.");
+        }
+        visitedPages.add(nextUrl);
         const response = await this.request(nextUrl);
         if (!response.ok) {
           if (page === 0) {
             throw await this.createSpotifyApiError(response, "Failed to load your Liked Songs.");
           }
-          break;
+          throw await this.createSpotifyApiError(
+            response,
+            "Spotify stopped while loading your Liked Songs. Try Sync again."
+          );
         }
         const json = (await response.json()) as {
           items?: Array<{ track?: SpotifyApiTrack }>;
@@ -286,10 +315,18 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
         .map((entry) => entry.track)
         .filter((track): track is SpotifyApiTrack => Boolean(track));
       let nextUrl = json.tracks?.next ?? undefined;
+      const visitedPages = new Set<string>();
       while (nextUrl) {
+        if (visitedPages.size >= 400 || visitedPages.has(nextUrl)) {
+          throw new Error("Spotify returned an invalid playlist pagination cursor.");
+        }
+        visitedPages.add(nextUrl);
         const pageResponse = await this.request(nextUrl);
         if (!pageResponse.ok) {
-          break;
+          throw await this.createSpotifyApiError(
+            pageResponse,
+            "Spotify stopped while loading that playlist. Try again."
+          );
         }
         const pageJson = (await pageResponse.json()) as {
           items?: Array<{ track?: SpotifyApiTrack }>;
@@ -334,16 +371,23 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
     if (!response.ok) {
       throw await this.createSpotifyApiError(response, "Could not update your Spotify library.");
     }
+    this.collectionsCache = undefined;
+    this.collectionTrackCache.delete(SPOTIFY_SAVED_TRACKS_COLLECTION_ID);
   }
 
   /** Fetches the user's saved-track ids (Liked Songs), capped, to drive like-state. */
-  async getSavedTrackIds(cap = 4000): Promise<string[]> {
+  async getSavedTrackIds(cap = 20_000): Promise<string[]> {
     const ids: string[] = [];
     let next: string | null = "/me/tracks?limit=50";
+    const visitedPages = new Set<string>();
     while (next && ids.length < cap) {
+      if (visitedPages.size >= 400 || visitedPages.has(next)) {
+        throw new Error("Spotify returned an invalid Liked Songs pagination cursor.");
+      }
+      visitedPages.add(next);
       const response = await this.request(next, { method: "GET" });
       if (!response.ok) {
-        break;
+        throw await this.createSpotifyApiError(response, "Could not load all of your Liked Songs.");
       }
       const json = (await response.json()) as {
         items?: Array<{ track?: { id?: string | null } | null }>;
@@ -355,6 +399,9 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
         }
       }
       next = json.next ?? null;
+    }
+    if (next) {
+      throw new Error("Your Spotify library is too large to load safely in one pass.");
     }
     return ids;
   }
@@ -556,7 +603,11 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
   // ---- Shared plumbing (used by data methods and by engine subclasses) ----
 
   protected async request(pathOrUrl: string, init: RequestInit = {}): Promise<Response> {
-    const token = await this.getAccessToken();
+    const cooldown = this.rateLimitedUntil - Date.now();
+    if (cooldown > 0) {
+      await this.delay(cooldown);
+    }
+    let token = await this.getAccessToken();
     if (!token) {
       throw new Error("Connect Spotify before requesting Spotify data.");
     }
@@ -568,7 +619,29 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
         throw new Error("Spotify session expired.");
       }
 
+      token = refreshed.accessToken;
       response = await this.executeRequest(pathOrUrl, refreshed.accessToken, init);
+    }
+
+    const method = (init.method ?? "GET").toUpperCase();
+    if (response.status === 429 && (method === "GET" || method === "HEAD")) {
+      const retryAfter = response.headers.get("retry-after");
+      const numericSeconds = Number(retryAfter);
+      const dateDelay = retryAfter ? Date.parse(retryAfter) - Date.now() : Number.NaN;
+      const waitMs = Math.min(
+        30_000,
+        Math.max(
+          1_000,
+          Number.isFinite(numericSeconds)
+            ? numericSeconds * 1_000
+            : Number.isFinite(dateDelay)
+              ? dateDelay
+              : 5_000
+        )
+      );
+      this.rateLimitedUntil = Math.max(this.rateLimitedUntil, Date.now() + waitMs);
+      await this.delay(waitMs + Math.floor(Math.random() * 250));
+      response = await this.executeRequest(pathOrUrl, token, init);
     }
 
     return response;
@@ -582,13 +655,17 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
     const headers = new Headers(init.headers ?? {});
     headers.set("Authorization", `Bearer ${token}`);
 
-    const url = pathOrUrl.startsWith("http")
-      ? pathOrUrl
-      : `https://api.spotify.com/v1${pathOrUrl}`;
+    const url = new URL(
+      pathOrUrl.startsWith("http") ? pathOrUrl : `https://api.spotify.com/v1${pathOrUrl}`
+    );
+    if (url.protocol !== "https:" || url.hostname !== "api.spotify.com") {
+      throw new Error("Spotify returned an untrusted API URL.");
+    }
 
-    return fetch(url, {
+    return fetch(url.toString(), {
       ...init,
-      headers
+      headers,
+      signal: init.signal ?? AbortSignal.timeout(12_000)
     });
   }
 
@@ -677,6 +754,12 @@ export abstract class SpotifyBaseAdapter implements PlaybackAdapter {
     value: T,
     ttlMs: number
   ): void {
+    if (!cache.has(key) && cache.size >= 100) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey !== undefined) {
+        cache.delete(oldestKey);
+      }
+    }
     cache.set(key, {
       value,
       expiresAt: Date.now() + ttlMs

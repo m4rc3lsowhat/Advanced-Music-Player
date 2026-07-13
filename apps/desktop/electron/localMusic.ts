@@ -14,6 +14,7 @@ const AUDIO_EXTENSIONS = new Set([
   ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".webm", ".mp4", ".alac", ".aiff", ".aif"
 ]);
 const MAX_SCAN_DEPTH = 8;
+const MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
 
 export interface LocalTrackFile {
   /** Stable id = sha1 of the absolute path; also the amp-local:// key. */
@@ -30,6 +31,8 @@ export class LocalMusicManager {
   /** id → file, rebuilt on every scan; the protocol handler maps ids back to whitelisted paths. */
   private index = new Map<string, LocalTrackFile>();
   private loaded = false;
+  private folderMutation: Promise<void> = Promise.resolve();
+  private scanGeneration = 0;
 
   constructor(userDataPath: string) {
     this.configPath = path.join(userDataPath, "local-music.json");
@@ -55,10 +58,30 @@ export class LocalMusicManager {
     this.loaded = true;
   }
 
-  private async saveConfig(): Promise<void> {
-    await fs.writeFile(this.configPath, JSON.stringify({ folders: this.folders }, null, 2), "utf8").catch(
-      () => undefined
-    );
+  private async saveConfig(folders: string[]): Promise<void> {
+    await fs.mkdir(path.dirname(this.configPath), { recursive: true });
+    const tempPath = `${this.configPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      await fs.writeFile(tempPath, JSON.stringify({ folders }, null, 2), "utf8");
+      await fs.rename(tempPath, this.configPath);
+    } catch (error) {
+      await fs.rm(tempPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async updateFolders(update: (folders: string[]) => string[]): Promise<string[]> {
+    let result: string[] = [];
+    const operation = this.folderMutation.then(async () => {
+      const next = update([...this.folders]);
+      await this.saveConfig(next);
+      this.folders = next;
+      this.scanGeneration += 1;
+      result = [...next];
+    });
+    this.folderMutation = operation.catch(() => undefined);
+    await operation;
+    return result;
   }
 
   async getFolders(): Promise<string[]> {
@@ -69,19 +92,15 @@ export class LocalMusicManager {
   async addFolder(folder: string): Promise<string[]> {
     await this.loadConfig();
     const normalized = path.resolve(folder);
-    if (!this.folders.includes(normalized)) {
-      this.folders.push(normalized);
-      await this.saveConfig();
-    }
-    return [...this.folders];
+    return this.updateFolders((folders) =>
+      folders.includes(normalized) ? folders : [...folders, normalized]
+    );
   }
 
   async removeFolder(folder: string): Promise<string[]> {
     await this.loadConfig();
     const normalized = path.resolve(folder);
-    this.folders = this.folders.filter((f) => f !== normalized);
-    await this.saveConfig();
-    return [...this.folders];
+    return this.updateFolders((folders) => folders.filter((candidate) => candidate !== normalized));
   }
 
   /** Whitelist check + lookup: only ids from the last scan, whose REAL path is inside a folder.
@@ -121,12 +140,33 @@ export class LocalMusicManager {
   async scan(): Promise<UnifiedTrack[]> {
     await this.loadConfig();
     const mm = await import("music-metadata");
+    const generation = ++this.scanGeneration;
+    const folders = [...this.folders];
     const nextIndex = new Map<string, LocalTrackFile>();
     const tracks: UnifiedTrack[] = [];
+    const files: string[] = [];
+    const seenFiles = new Set<string>();
 
-    for (const folder of this.folders) {
-      const files = await walkAudioFiles(folder, MAX_SCAN_DEPTH).catch(() => [] as string[]);
-      for (const absolutePath of files) {
+    for (const folder of folders) {
+      const realFolder = await fs.realpath(folder).catch(() => undefined);
+      if (!realFolder) {
+        continue;
+      }
+      const candidates = await walkAudioFiles(folder, MAX_SCAN_DEPTH).catch(() => [] as string[]);
+      for (const candidate of candidates) {
+        const absolutePath = await fs.realpath(candidate).catch(() => undefined);
+        if (!absolutePath || !isInside(realFolder, absolutePath) || seenFiles.has(absolutePath)) {
+          continue;
+        }
+        seenFiles.add(absolutePath);
+        files.push(absolutePath);
+      }
+    }
+
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(6, files.length) }, async () => {
+      while (cursor < files.length) {
+        const absolutePath = files[cursor++];
         const id = hashPath(absolutePath);
         try {
           const metadata = await mm.parseFile(absolutePath, { duration: true, skipCovers: false });
@@ -140,9 +180,28 @@ export class LocalMusicManager {
           tracks.push(buildFilenameTrack(id, absolutePath));
         }
       }
+    });
+    await Promise.all(workers);
+
+    // A folder was added or removed while metadata parsing was in flight. Restart from the current
+    // configuration so neither the main-process index nor the renderer receives an obsolete scan.
+    if (generation !== this.scanGeneration) {
+      return this.scan();
     }
 
     this.index = nextIndex;
+    const retainedArtwork = new Set(
+      [...nextIndex.values()].flatMap((entry) => (entry.artworkPath ? [path.resolve(entry.artworkPath)] : []))
+    );
+    const cachedArtwork = await fs.readdir(this.artworkDir).catch(() => [] as string[]);
+    await Promise.all(
+      cachedArtwork.map((name) => {
+        const candidate = path.resolve(this.artworkDir, name);
+        return retainedArtwork.has(candidate)
+          ? Promise.resolve()
+          : fs.rm(candidate, { force: true }).catch(() => undefined);
+      })
+    );
     // Alphabetical by title keeps the Library list stable across rescans.
     tracks.sort((a, b) => a.title.localeCompare(b.title));
     return tracks;
@@ -152,18 +211,47 @@ export class LocalMusicManager {
     id: string,
     picture: { data: Uint8Array; format?: string } | undefined
   ): Promise<string | undefined> {
-    if (!picture?.data?.length) {
+    if (!picture?.data?.length || picture.data.length > MAX_ARTWORK_BYTES) {
       return undefined;
     }
-    const ext = picture.format?.includes("png") ? "png" : "jpg";
+    const ext = detectArtworkExtension(picture.data);
+    if (!ext) {
+      return undefined;
+    }
     const target = path.join(this.artworkDir, `${id}.${ext}`);
+    const tempPath = `${target}.${process.pid}.${Date.now()}.tmp`;
     try {
-      await fs.writeFile(target, Buffer.from(picture.data));
+      await fs.writeFile(tempPath, Buffer.from(picture.data));
+      await fs.rename(tempPath, target);
       return target;
     } catch {
+      await fs.rm(tempPath, { force: true }).catch(() => undefined);
       return undefined;
     }
   }
+}
+
+function detectArtworkExtension(data: Uint8Array): "png" | "jpg" | "webp" | undefined {
+  if (
+    data.length >= 8 &&
+    data[0] === 0x89 &&
+    data[1] === 0x50 &&
+    data[2] === 0x4e &&
+    data[3] === 0x47
+  ) {
+    return "png";
+  }
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return "jpg";
+  }
+  if (
+    data.length >= 12 &&
+    Buffer.from(data.subarray(0, 4)).toString("ascii") === "RIFF" &&
+    Buffer.from(data.subarray(8, 12)).toString("ascii") === "WEBP"
+  ) {
+    return "webp";
+  }
+  return undefined;
 }
 
 function isInside(folder: string, file: string): boolean {

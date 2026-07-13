@@ -51,11 +51,13 @@ export class YouTubeIframeAdapter implements PlaybackAdapter {
   readonly provider = "youtube" as const;
   private listeners = new Set<PlaybackAdapterListener>();
   private iframe?: HTMLIFrameElement;
+  private pendingIframe?: HTMLIFrameElement;
   private frameReady?: Promise<HTMLIFrameElement>;
   private playerOrigin?: string;
   private snapshot: PlaybackAdapterSnapshot;
   private currentTrackId?: string;
   private playToken = 0;
+  private frameGeneration = 0;
   private messageHandler?: (event: MessageEvent) => void;
 
   constructor(initialVolume?: number) {
@@ -138,7 +140,9 @@ export class YouTubeIframeAdapter implements PlaybackAdapter {
   }
 
   async teardown(): Promise<void> {
+    this.playToken += 1;
     this.command({ cmd: "stop" });
+    this.disposeFrame();
     this.snapshot = { ...this.snapshot, status: "idle" };
   }
 
@@ -150,8 +154,12 @@ export class YouTubeIframeAdapter implements PlaybackAdapter {
     if (this.frameReady) {
       return this.frameReady;
     }
+    const generation = ++this.frameGeneration;
     this.frameReady = (async () => {
       const origin = await getYouTubePlayerOrigin();
+      if (generation !== this.frameGeneration) {
+        throw new Error("YouTube player initialization was cancelled.");
+      }
       if (!origin) {
         throw new Error("YouTube player is unavailable (desktop host not running).");
       }
@@ -165,11 +173,17 @@ export class YouTubeIframeAdapter implements PlaybackAdapter {
       iframe.style.cssText =
         "position:fixed;left:-9999px;top:-9999px;width:320px;height:180px;border:0;pointer-events:none;opacity:0;";
       iframe.src = origin;
+      this.pendingIframe = iframe;
 
       return await new Promise<HTMLIFrameElement>((resolve, reject) => {
         let settled = false;
+        let timeout: number | undefined;
         this.messageHandler = (event: MessageEvent) => {
-          if (event.origin !== this.playerOrigin) {
+          if (
+            generation !== this.frameGeneration ||
+            event.origin !== this.playerOrigin ||
+            event.source !== iframe.contentWindow
+          ) {
             return;
           }
           const data = event.data as PlayerMessage;
@@ -178,7 +192,11 @@ export class YouTubeIframeAdapter implements PlaybackAdapter {
           }
           if (data.type === "ready" && !settled) {
             settled = true;
+            if (timeout !== undefined) {
+              window.clearTimeout(timeout);
+            }
             this.iframe = iframe;
+            this.pendingIframe = undefined;
             resolve(iframe);
             return;
           }
@@ -188,12 +206,15 @@ export class YouTubeIframeAdapter implements PlaybackAdapter {
         iframe.onerror = () => {
           if (!settled) {
             settled = true;
+            if (timeout !== undefined) {
+              window.clearTimeout(timeout);
+            }
             reject(new Error("Couldn't load the YouTube player."));
           }
         };
         document.body.appendChild(iframe);
         // Guard: if the player never signals ready, fail so the queue can move on.
-        setTimeout(() => {
+        timeout = window.setTimeout(() => {
           if (!settled) {
             settled = true;
             reject(new Error("YouTube player didn't start."));
@@ -201,7 +222,26 @@ export class YouTubeIframeAdapter implements PlaybackAdapter {
         }, 15000);
       });
     })();
+    const attempt = this.frameReady;
+    void attempt.catch(() => this.disposeFrame(generation));
     return this.frameReady;
+  }
+
+  private disposeFrame(expectedGeneration?: number): void {
+    if (expectedGeneration !== undefined && expectedGeneration !== this.frameGeneration) {
+      return;
+    }
+    this.frameGeneration += 1;
+    if (this.messageHandler) {
+      window.removeEventListener("message", this.messageHandler);
+      this.messageHandler = undefined;
+    }
+    this.iframe?.remove();
+    this.pendingIframe?.remove();
+    this.iframe = undefined;
+    this.pendingIframe = undefined;
+    this.frameReady = undefined;
+    this.playerOrigin = undefined;
   }
 
   private handlePlayerMessage(data: PlayerMessage): void {

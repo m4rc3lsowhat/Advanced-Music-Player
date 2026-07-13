@@ -1,12 +1,18 @@
-import {
+import { register } from "node:module";
+
+register("./_tsresolve.mjs", import.meta.url);
+
+const {
   detectScript,
   scoreTwinMatch,
   pickBestTwin,
   scoreStationCandidate,
-  normalizeTitle
-} from "../src/lib/mixes/composition.ts";
-import { normalizeGenre, normalizeGenres } from "../src/lib/genreNormalize.ts";
-import { tempoBucketForBpm } from "../src/lib/trackFeatures.ts";
+  normalizeTitle,
+  localDateKey,
+  libraryMixFingerprint
+} = await import("../src/lib/mixes/composition.ts");
+const { normalizeGenre, normalizeGenres } = await import("../src/lib/genreNormalize.ts");
+const { tempoBucketForBpm } = await import("../src/lib/trackFeatures.ts");
 
 let failures = 0;
 let passes = 0;
@@ -58,6 +64,20 @@ assert(
     JSON.stringify(["Hip Hop", "Trap", "Rap"]),
   "normalizeGenres dedupes + maps"
 );
+
+assert(
+  localDateKey(new Date(2026, 6, 13, 23, 30)) === "2026-07-13",
+  "Daily Mix date follows the local calendar"
+);
+const fingerprintA = libraryMixFingerprint([
+  track("spotify", "Artist A", "Shared Song"),
+  track("soundcloud", "Artist A", "Shared Song")
+]);
+const fingerprintB = libraryMixFingerprint([
+  track("soundcloud", "Artist A", "Shared Song"),
+  track("spotify", "Artist A", "Shared Song")
+]);
+assert(fingerprintA === fingerprintB, "mix fingerprint is order and provider agnostic");
 
 // ---- tempoBucketForBpm ----
 assert(tempoBucketForBpm(null) === null, "null bpm → null");

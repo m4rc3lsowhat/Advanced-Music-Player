@@ -61,23 +61,116 @@ function readJson<T>(key: string, fallback: T): T {
   }
 
   try {
-    return JSON.parse(raw) as T;
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(fallback) && !Array.isArray(parsed)) {
+      return fallback;
+    }
+    if (
+      fallback !== null &&
+      typeof fallback === "object" &&
+      !Array.isArray(fallback) &&
+      (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+    ) {
+      return fallback;
+    }
+    return parsed as T;
   } catch {
     return fallback;
   }
 }
 
-function writeJson<T>(key: string, value: T): void {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isProvider(value: unknown): value is Provider {
+  return value === "spotify" || value === "soundcloud" || value === "youtube" || value === "local";
+}
+
+function isUnifiedTrack(value: unknown): value is UnifiedTrack {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    isProvider(value.provider) &&
+    typeof value.providerTrackId === "string" &&
+    typeof value.title === "string" &&
+    Array.isArray(value.creators) &&
+    value.creators.every((creator) => typeof creator === "string") &&
+    typeof value.durationMs === "number" &&
+    Number.isFinite(value.durationMs) &&
+    typeof value.explicit === "boolean" &&
+    typeof value.playable === "boolean"
+  );
+}
+
+function isPlaylistEntry(value: unknown): value is PlaylistEntry {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.playlistId === "string" &&
+    typeof value.order === "number" &&
+    Number.isFinite(value.order) &&
+    typeof value.addedAt === "string" &&
+    isUnifiedTrack(value.track)
+  );
+}
+
+function readStoredPlaylists(): UnifiedPlaylist[] {
+  return readJson<unknown[]>(PLAYLISTS_KEY, []).flatMap((value) => {
+    if (
+      !isRecord(value) ||
+      typeof value.id !== "string" ||
+      typeof value.ownerId !== "string" ||
+      typeof value.title !== "string" ||
+      typeof value.createdAt !== "string" ||
+      typeof value.updatedAt !== "string" ||
+      !Array.isArray(value.entries)
+    ) {
+      return [];
+    }
+    return [{ ...value, entries: value.entries.filter(isPlaylistEntry) } as unknown as UnifiedPlaylist];
+  });
+}
+
+function readStoredProjectTracks(): ProjectTrack[] {
+  return readJson<unknown[]>(PROJECT_TRACKS_KEY, []).filter((value): value is ProjectTrack =>
+    Boolean(
+      isRecord(value) &&
+        typeof value.id === "string" &&
+        typeof value.ownerId === "string" &&
+        isProvider(value.provider) &&
+        typeof value.providerTrackId === "string" &&
+        typeof value.source === "string" &&
+        typeof value.createdAt === "string" &&
+        typeof value.updatedAt === "string" &&
+        isUnifiedTrack(value.track)
+    )
+  );
+}
+
+function readStoredRecentTracks(): UnifiedTrack[] {
+  return readJson<unknown[]>(RECENTS_KEY, []).filter(isUnifiedTrack);
+}
+
+function writeJson<T>(key: string, value: T): boolean {
   if (!canUseStorage()) {
-    return;
+    return false;
   }
 
   try {
     window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
   } catch (error) {
     // Most likely QuotaExceededError on a very large library. Throwing here used to abort the
     // caller (add/import/like) midway — a skipped persist is the lesser failure, so log and move on.
     console.warn(`Persist failed for "${key}"`, error);
+    return false;
+  }
+}
+
+function writeJsonOrThrow<T>(key: string, value: T, label: string): void {
+  if (!writeJson(key, value)) {
+    throw new Error(`Could not save ${label}. Local storage may be full or unavailable.`);
   }
 }
 
@@ -89,7 +182,7 @@ function hydrateTrackSnapshot(track: UnifiedTrack, projectTrackId?: string | nul
 }
 
 export async function loadPlaylists(): Promise<UnifiedPlaylist[]> {
-  const rawStored = readJson<UnifiedPlaylist[]>(PLAYLISTS_KEY, []);
+  const rawStored = readStoredPlaylists();
   const stored = rawStored
     .filter((playlist) => playlist.id !== DEMO_PLAYLIST_ID)
     .map((playlist) => ({
@@ -113,7 +206,7 @@ export async function loadPlaylists(): Promise<UnifiedPlaylist[]> {
 }
 
 export async function loadProjectTracks(): Promise<ProjectTrack[]> {
-  const stored = readJson<ProjectTrack[]>(PROJECT_TRACKS_KEY, []);
+  const stored = readStoredProjectTracks();
   const cleaned = stored.filter((item) => !isDemoTrack(item.track));
   if (cleaned.length !== stored.length) {
     writeJson(PROJECT_TRACKS_KEY, cleaned);
@@ -128,7 +221,7 @@ export async function upsertProjectTrack(
   const normalizedProviderTrackId = track.providerTrackId || track.id;
   const now = new Date().toISOString();
 
-  const all = readJson<ProjectTrack[]>(PROJECT_TRACKS_KEY, []);
+  const all = readStoredProjectTracks();
   const existing = all.find(
     (item) => item.provider === track.provider && item.providerTrackId === normalizedProviderTrackId
   );
@@ -148,7 +241,7 @@ export async function upsertProjectTrack(
     updatedAt: now
   };
   const remaining = all.filter((item) => item.id !== nextProjectTrack.id);
-  writeJson(PROJECT_TRACKS_KEY, [nextProjectTrack, ...remaining]);
+  writeJsonOrThrow(PROJECT_TRACKS_KEY, [nextProjectTrack, ...remaining], "the music library");
   return nextProjectTrack;
 }
 
@@ -161,7 +254,7 @@ export async function upsertProjectTracks(
   }
 
   const now = new Date().toISOString();
-  const all = readJson<ProjectTrack[]>(PROJECT_TRACKS_KEY, []);
+  const all = readStoredProjectTracks();
   const byKey = new Map<string, ProjectTrack>(
     all.map((item) => [`${item.provider}:${item.providerTrackId}`, item] as const)
   );
@@ -194,22 +287,23 @@ export async function upsertProjectTracks(
   }
 
   const remaining = all.filter((item) => !incomingKeys.has(`${item.provider}:${item.providerTrackId}`));
-  writeJson(PROJECT_TRACKS_KEY, [...incoming, ...remaining]);
+  writeJsonOrThrow(PROJECT_TRACKS_KEY, [...incoming, ...remaining], "the music library");
   return incoming;
 }
 
 export async function upsertPlaylist(playlist: UnifiedPlaylist): Promise<void> {
-  const existing = readJson<UnifiedPlaylist[]>(PLAYLISTS_KEY, []);
+  const existing = readStoredPlaylists();
   const next = existing.filter((item) => item.id !== playlist.id);
   next.unshift(playlist);
-  writeJson(PLAYLISTS_KEY, next);
+  writeJsonOrThrow(PLAYLISTS_KEY, next, "the playlist");
 }
 
 export async function deletePlaylist(id: string): Promise<void> {
-  const all = readJson<UnifiedPlaylist[]>(PLAYLISTS_KEY, []);
-  writeJson(
+  const all = readStoredPlaylists();
+  writeJsonOrThrow(
     PLAYLISTS_KEY,
-    all.filter((playlist) => playlist.id !== id)
+    all.filter((playlist) => playlist.id !== id),
+    "the playlist change"
   );
 }
 
@@ -218,7 +312,7 @@ export async function replaceRecentTracks(tracks: UnifiedTrack[]): Promise<void>
 }
 
 export async function loadRecentTracks(): Promise<UnifiedTrack[]> {
-  const stored = readJson<UnifiedTrack[]>(RECENTS_KEY, []);
+  const stored = readStoredRecentTracks();
   const cleaned = stored.filter((track) => !isDemoTrack(track));
   if (cleaned.length !== stored.length) {
     writeJson(RECENTS_KEY, cleaned);
@@ -363,7 +457,7 @@ interface PlayEvent {
 export interface ListeningStats {
   totalPlays: number;
   weekPlays: number;
-  providerSplit: { spotify: number; soundcloud: number };
+  providerSplit: Record<Provider, number>;
   topArtists: Array<{ artist: string; count: number }>;
   topTracks: Array<{ key: string; title: string; artist: string; provider: Provider; count: number }>;
   /** Plays per calendar day for the last 7 days, oldest first (label = short weekday name). */
@@ -393,7 +487,12 @@ export function loadListeningStats(topN = 8): ListeningStats {
   const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
   const artists = new Map<string, number>();
   const tracks = new Map<string, { title: string; artist: string; provider: Provider; count: number }>();
-  const providerSplit = { spotify: 0, soundcloud: 0 };
+  const providerSplit: Record<Provider, number> = {
+    spotify: 0,
+    soundcloud: 0,
+    youtube: 0,
+    local: 0
+  };
   let weekPlays = 0;
 
   // Last 7 calendar days (local time), oldest first, so the Stats page can chart daily activity.
@@ -420,7 +519,7 @@ export function loadListeningStats(topN = 8): ListeningStats {
     } else {
       tracks.set(event.key, { title: event.title, artist: event.artist, provider: event.provider, count: 1 });
     }
-    if (event.provider === "spotify" || event.provider === "soundcloud") {
+    if (isProvider(event.provider)) {
       providerSplit[event.provider] += 1;
     }
     if (event.at >= weekAgo) {
@@ -456,4 +555,5 @@ export function loadListeningStats(topN = 8): ListeningStats {
 /** Wipe the on-device listening history. */
 export function clearListeningStats(): void {
   writeJson(PLAY_LOG_KEY, []);
+  writeJson(RECENTS_KEY, []);
 }

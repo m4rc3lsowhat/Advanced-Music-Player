@@ -33,7 +33,7 @@ export class StealthClient {
       const clientRequest = net.request({
         method,
         url,
-        redirect: "follow"
+        redirect: init.redirect ?? "follow"
       });
 
       // Apply default + custom headers

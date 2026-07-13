@@ -58,7 +58,6 @@ import {
   X
 } from "lucide-react";
 import type { OAuthProvider, ProjectTrack, Provider, UnifiedTrack } from "@amp/core";
-import { getAppEnv } from "@/lib/env";
 import {
   finishDesktopStartupWindow,
   openExternal,
@@ -114,7 +113,7 @@ const providerConsentCopy: Record<
   spotify: {
     title: "Review Spotify access",
     summary:
-      "Spotify sign-in stays inside AMP. The app only asks for the scopes needed for in-app playback and library import.",
+      "Spotify sign-in opens in your default browser and returns to AMP. The app only asks for the scopes needed for in-app playback and library import.",
     access: [
       "Read your Spotify profile basics so the app can label your connected account.",
       "Read your saved library and playback state for search, queue handoff, and resume.",
@@ -122,7 +121,7 @@ const providerConsentCopy: Record<
       "No playlist-edit permission is requested, and your mixed playlists stay inside AMP."
     ],
     caution:
-      "Spotify still shows its own official consent screen, but the full flow stays inside the desktop app.",
+      "Spotify shows its official consent screen in your browser, then returns the result to the desktop app.",
     confirmLabel: "Open Spotify sign-in"
   },
   soundcloud: {
@@ -343,16 +342,22 @@ function PlaybackHotkeys() {
       );
     };
     const onKey = (event: KeyboardEvent) => {
-      if (isInteractiveTarget(event.target)) {
+      if (event.defaultPrevented || event.repeat || isInteractiveTarget(event.target)) {
         return;
       }
-      if (event.code === "Space") {
+      if (
+        event.code === "Space" &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !event.shiftKey
+      ) {
         event.preventDefault();
         void togglePlayback();
-      } else if ((event.ctrlKey || event.metaKey) && event.key === "ArrowRight") {
+      } else if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key === "ArrowRight") {
         event.preventDefault();
         void next();
-      } else if ((event.ctrlKey || event.metaKey) && event.key === "ArrowLeft") {
+      } else if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key === "ArrowLeft") {
         event.preventDefault();
         void previous();
       }
@@ -383,6 +388,7 @@ function SongColor() {
     (state) => state.playback.queue[state.playback.currentIndex]?.artworkUrl
   );
   const accentSource = useAppStore((state) => state.accentSource);
+  const runtime = useAppStore((state) => state.runtime);
   const beatIntensity = useAppStore((state) => state.beatIntensity);
   const status = useAppStore((state) => state.playback.status);
   // The song's artwork colour is the fixed hue; audio mode only pulses its saturation/brightness.
@@ -398,13 +404,13 @@ function SongColor() {
   // taps the SoundCloud media element, because routing playback through Web Audio silenced/locked
   // certain SoundCloud streams. The reactor writes CSS vars per animation frame — no React renders.
   useEffect(() => {
-    if (accentSource !== "audio" || status !== "playing") {
+    if (accentSource !== "audio" || runtime?.platform !== "win32" || status !== "playing") {
       audioReactor.stop();
       return;
     }
     audioReactor.start();
     return () => audioReactor.stop();
-  }, [accentSource, status]);
+  }, [accentSource, runtime?.platform, status]);
 
   // Leaving audio mode releases the system-audio capture entirely (and re-arms a future retry).
   useEffect(() => {
@@ -412,6 +418,17 @@ function SongColor() {
       audioReactor.releaseLoopback();
     }
   }, [accentSource]);
+
+  // A saved audio-reactive preference still needs one fresh user gesture after restart before
+  // Chromium will grant loopback. Prime on the next click or tap anywhere in AMP.
+  useEffect(() => {
+    if (accentSource !== "audio" || runtime?.platform !== "win32") {
+      return;
+    }
+    const prime = () => audioReactor.primeLoopback();
+    window.addEventListener("pointerdown", prime, { capture: true, once: true });
+    return () => window.removeEventListener("pointerdown", prime, { capture: true });
+  }, [accentSource, runtime?.platform]);
 
   // Artwork colour is the baseline (and the full answer in "artwork" mode, or for Spotify).
   // "static" mode opts out entirely: the UI stays on the fixed neutral accent regardless of art.
@@ -809,18 +826,21 @@ function TrackContextMenu({ onAddToPlaylist }: { onAddToPlaylist(track: UnifiedT
 function StartupSplash({ showCustomChrome }: { showCustomChrome: boolean }) {
   const bootStage = useAppStore((state) => state.bootStage);
   const bootProgress = useAppStore((state) => state.bootProgress);
+  const initializationError = useAppStore((state) => state.initializationError);
+  const initializing = useAppStore((state) => state.initializing);
+  const initialize = useAppStore((state) => state.initialize);
   const pct = Math.round(Math.min(1, Math.max(0, bootProgress)) * 100);
 
   return (
     <div
-      className="flex h-screen flex-col overflow-hidden text-[var(--ink)]"
+      className="flex h-screen min-h-0 flex-col overflow-hidden text-[var(--ink)]"
       style={{
         background:
           "radial-gradient(120% 90% at 50% -10%, rgba(var(--song-rgb), 0.28), transparent 68%), var(--shell)"
       }}
     >
       <DesktopTitleBar visible={showCustomChrome} />
-      <div className="grid flex-1 place-items-center px-8">
+      <div className="grid min-h-0 flex-1 place-items-center overflow-y-auto px-8 py-6">
         <div
           className="w-full max-w-sm rounded-[var(--radius-xl)] border border-[var(--edge)] bg-[var(--panel-strong)] p-7 text-center shadow-[0_28px_90px_rgba(0,0,0,0.32)]"
         >
@@ -844,6 +864,19 @@ function StartupSplash({ showCustomChrome }: { showCustomChrome: boolean }) {
             />
           </div>
           <p className="mt-2 text-[11px] tabular-nums text-[var(--muted)]">{pct}%</p>
+          {initializationError ? (
+            <div className="mt-5 rounded-[var(--radius-md)] border border-red-400/30 bg-red-400/8 p-3 text-left">
+              <p className="break-words text-sm text-red-100">{initializationError}</p>
+              <button
+                type="button"
+                disabled={initializing}
+                onClick={() => void initialize()}
+                className="mt-3 rounded-[var(--radius-sm)] bg-[var(--paper)] px-3 py-1.5 text-sm font-semibold text-[var(--shell)] disabled:opacity-50"
+              >
+                {initializing ? "Retrying…" : "Try again"}
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>
@@ -1632,7 +1665,8 @@ function MiniButton({
 }
 
 function NowPlayingPanel() {
-  const playback = useAppStore((state) => state.playback);
+  const queue = useAppStore((state) => state.playback.queue);
+  const currentIndex = useAppStore((state) => state.playback.currentIndex);
   const playTrack = useAppStore((state) => state.playTrack);
   const reorderQueue = useAppStore((state) => state.reorderQueue);
   const clearQueue = useAppStore((state) => state.clearQueue);
@@ -1643,7 +1677,7 @@ function NowPlayingPanel() {
   const openMix = useAppStore((state) => state.openMix);
   const openArtist = useAppStore((state) => state.openArtist);
   const navigate = useNavigate();
-  const currentTrack = playback.queue[playback.currentIndex];
+  const currentTrack = queue[currentIndex];
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
   const endDrag = () => {
@@ -1726,11 +1760,11 @@ function NowPlayingPanel() {
       <div className="mt-4 flex shrink-0 items-baseline justify-between gap-2">
         <p className="kicker">
           Queue
-          {playback.queue.length > 0 ? (
-            <span className="tnum ml-1.5 text-[var(--faint)]">{playback.queue.length}</span>
+          {queue.length > 0 ? (
+            <span className="tnum ml-1.5 text-[var(--faint)]">{queue.length}</span>
           ) : null}
         </p>
-        {playback.queue.length > 1 ? (
+        {queue.length > 1 ? (
           <button
             type="button"
             onClick={clearQueue}
@@ -1742,10 +1776,10 @@ function NowPlayingPanel() {
         ) : null}
       </div>
       <div className="mt-2 min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
-        {playback.queue.length === 0 ? (
+        {queue.length === 0 ? (
           <p className="px-1 text-xs text-[var(--muted)]">Nothing queued.</p>
         ) : (
-          playback.queue.map((track, index) => (
+          queue.map((track, index) => (
             <button
               key={`${track.id}-${index}`}
               type="button"
@@ -1771,14 +1805,14 @@ function NowPlayingPanel() {
               }}
               onDragEnd={endDrag}
               // Jumping within the SAME queue must keep its "Playing from" source label intact.
-              onClick={() => void playTrack(track, playback.queue, queueSource)}
+              onClick={() => void playTrack(track, queue, queueSource)}
               onContextMenu={(event) => {
                 event.preventDefault();
                 openTrackMenu(track, event.clientX, event.clientY, { source: "queue", queueIndex: index });
               }}
               className={cn(
                 "flex w-full cursor-grab items-center gap-2 rounded-[var(--radius-sm)] border border-l-2 p-1.5 text-left transition active:cursor-grabbing",
-                index === playback.currentIndex
+                index === currentIndex
                   ? "border-[var(--acid)]/50 bg-[var(--paper)]/8"
                   : "border-transparent hover:bg-white/5",
                 dragIndex === index && "opacity-40",
@@ -2495,6 +2529,8 @@ function AddToPlaylistDialog({
     try {
       await commitToPlaylist(playlistId);
       setAddedIds((current) => [...current, playlistId]);
+    } catch {
+      // The store surfaces the persistence error; keep this playlist eligible for a retry.
     } finally {
       setBusyId(null);
     }
@@ -2511,6 +2547,8 @@ function AddToPlaylistDialog({
       await commitToPlaylist(id);
       setAddedIds((current) => [...current, id]);
       setDraftTitle("");
+    } catch {
+      // The store surfaces the persistence error; leave the dialog open for a retry.
     } finally {
       setCreating(false);
     }
@@ -2534,7 +2572,7 @@ function AddToPlaylistDialog({
           role="dialog"
           aria-modal="true"
           onClick={(event) => event.stopPropagation()}
-          className="vibrancy glass-overlay z-[50] w-full max-w-md rounded-[var(--radius-xl)] p-5"
+          className="vibrancy glass-overlay z-[50] max-h-[calc(100dvh-2rem)] w-full max-w-md overflow-y-auto rounded-[var(--radius-xl)] p-5"
         >
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
@@ -2707,7 +2745,7 @@ function HomePage() {
     if (projectTracks.length >= 4) {
       void generateDailyMixes();
     }
-  }, [projectTracks.length, generateDailyMixes]);
+  }, [projectTracks, generateDailyMixes]);
 
   return (
     <div className="space-y-4">
@@ -2951,7 +2989,7 @@ const MIX_KIND_LABEL: Record<string, string> = {
 function MixDetailPage() {
   const activeMix = useAppStore((state) => state.activeMix);
   const playTrack = useAppStore((state) => state.playTrack);
-  const playback = useAppStore((state) => state.playback);
+  const currentTrack = useAppStore((state) => state.playback.queue[state.playback.currentIndex]);
   const connections = useAppStore((state) => state.connections);
   const libraries = useAppStore((state) => state.libraries);
   const spotifyLikedTrackIds = useAppStore((state) => state.spotifyLikedTrackIds);
@@ -2979,7 +3017,6 @@ function MixDetailPage() {
     return <Navigate to="/" replace />;
   }
 
-  const currentTrack = playback.queue[playback.currentIndex];
   const currentKey = currentTrack ? getTrackUiKey(currentTrack) : undefined;
   const tiles = activeMix.tracks.slice(0, 4);
   const mixSource: { kind: "station" | "mix"; label: string; mixId: string } = {
@@ -3100,7 +3137,7 @@ function ArtistPage() {
   const activeArtist = useAppStore((state) => state.activeArtist);
   const playTrack = useAppStore((state) => state.playTrack);
   const startStation = useAppStore((state) => state.startStation);
-  const playback = useAppStore((state) => state.playback);
+  const currentTrack = useAppStore((state) => state.playback.queue[state.playback.currentIndex]);
   const connections = useAppStore((state) => state.connections);
   const libraries = useAppStore((state) => state.libraries);
   const spotifyLikedTrackIds = useAppStore((state) => state.spotifyLikedTrackIds);
@@ -3137,7 +3174,6 @@ function ArtistPage() {
   }
 
   const { topTracks, albums } = activeArtist;
-  const currentTrack = playback.queue[playback.currentIndex];
   const currentKey = currentTrack ? getTrackUiKey(currentTrack) : undefined;
   const artistSource = { kind: "artist" as const, label: activeArtist.name };
   const meta = [
@@ -3293,7 +3329,7 @@ function ArtistPage() {
 function AlbumPage() {
   const activeAlbum = useAppStore((state) => state.activeAlbum);
   const playTrack = useAppStore((state) => state.playTrack);
-  const playback = useAppStore((state) => state.playback);
+  const currentTrack = useAppStore((state) => state.playback.queue[state.playback.currentIndex]);
   const connections = useAppStore((state) => state.connections);
   const libraries = useAppStore((state) => state.libraries);
   const spotifyLikedTrackIds = useAppStore((state) => state.spotifyLikedTrackIds);
@@ -3330,7 +3366,6 @@ function AlbumPage() {
     );
   }
 
-  const currentTrack = playback.queue[playback.currentIndex];
   const currentKey = currentTrack ? getTrackUiKey(currentTrack) : undefined;
   const albumSource = { kind: "album" as const, label: activeAlbum.name };
 
@@ -3992,7 +4027,7 @@ function ProviderPlaylistImport({
       <SectionCard>
         <SectionHeader title={`${label} playlists`} />
         <p className="text-sm text-[var(--muted)]">
-          Connect {label} on the Library tab to browse and import your playlists.
+          Connect {label} in Settings to browse and import your playlists.
         </p>
       </SectionCard>
     );
@@ -4024,7 +4059,7 @@ function ProviderPlaylistImport({
 
       {playlists.length === 0 ? (
         <div className="mt-5">
-          <EmptyState>No {label} playlists loaded yet. Hit Sync on the Library tab, then come back.</EmptyState>
+          <EmptyState>No {label} playlists loaded yet. Sync the provider in Settings, then come back.</EmptyState>
         </div>
       ) : (
         <div className="mt-5 space-y-3">
@@ -4181,7 +4216,11 @@ function PlaylistsPage() {
               />
             </div>
             <div className="flex gap-3">
-              <Btn kind="primary" onClick={() => void playPlaylist(activePlaylist.id)}>
+              <Btn
+                kind="primary"
+                disabled={activePlaylist.entries.length === 0}
+                onClick={() => void playPlaylist(activePlaylist.id)}
+              >
                 Play queue
               </Btn>
               <Btn kind="ghost" onClick={() => setConfirmDeleteId(activePlaylist.id)}>
@@ -4331,7 +4370,11 @@ function SoundCloudConnectCard({ onRequestOAuth }: { onRequestOAuth(): void }) {
   const [open, setOpen] = useState(false);
   const [view, setView] = useState<SoundCloudConnectView>("methods");
   const [selectedProfileId, setSelectedProfileId] = useState("");
-  useEscapeClose(open, () => setOpen(false));
+  const closeConnect = () => {
+    setOpen(false);
+    setView("methods");
+  };
+  useEscapeClose(open, closeConnect);
 
   const isConnected = connection.status === "connected";
   const isLoading = connection.status === "connecting" || localStatus === "connecting" || localStatus === "syncing";
@@ -4357,7 +4400,7 @@ function SoundCloudConnectCard({ onRequestOAuth }: { onRequestOAuth(): void }) {
   }, [profiles, selectedProfileId]);
 
   useEffect(() => {
-    if (view !== "browser-running" || !selectedProfileId) {
+    if (!open || view !== "browser-running" || !selectedProfileId) {
       return;
     }
     let cancelled = false;
@@ -4390,14 +4433,14 @@ function SoundCloudConnectCard({ onRequestOAuth }: { onRequestOAuth(): void }) {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [view, selectedProfileId, connectLocalProfile]);
+  }, [open, view, selectedProfileId, connectLocalProfile]);
 
   // Guided sign-in: after we open the real browser to the SoundCloud login, poll the existing
   // cookie-read connect until the freshly-created session token appears (works while the browser
   // stays open on macOS). On Windows the cookie DB is locked, so a browser-running result routes to
   // the "close browser to finish" view.
   useEffect(() => {
-    if (view !== "waiting-signin" || !selectedProfileId) {
+    if (!open || view !== "waiting-signin" || !selectedProfileId) {
       return;
     }
     let cancelled = false;
@@ -4433,7 +4476,7 @@ function SoundCloudConnectCard({ onRequestOAuth }: { onRequestOAuth(): void }) {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [view, selectedProfileId, connectLocalProfile]);
+  }, [open, view, selectedProfileId, connectLocalProfile]);
 
   const openConnect = (nextView: SoundCloudConnectView = "methods") => {
     setView(nextView);
@@ -4636,7 +4679,7 @@ function SoundCloudConnectCard({ onRequestOAuth }: { onRequestOAuth(): void }) {
                 </div>
                 <button
                   type="button"
-                  onClick={() => setOpen(false)}
+                  onClick={closeConnect}
                   className="grid h-10 w-10 place-items-center rounded-full border border-[var(--edge)] text-[var(--muted)] transition hover:text-[var(--paper)]"
                   aria-label="Close"
                 >
@@ -4970,6 +5013,7 @@ function SoundCloudInlineError({ message }: { message: string }) {
 function AppearanceCard() {
   const accentSource = useAppStore((state) => state.accentSource);
   const setAccentSource = useAppStore((state) => state.setAccentSource);
+  const runtime = useAppStore((state) => state.runtime);
   const beatIntensity = useAppStore((state) => state.beatIntensity);
   const setBeatIntensity = useAppStore((state) => state.setBeatIntensity);
 
@@ -4978,6 +5022,15 @@ function AppearanceCard() {
     { id: "audio", label: "Song audio", hint: "Gradient and accent pulse on the beat." },
     { id: "static", label: "Static", hint: "Fixed neutral accent — no colour or pulse." }
   ];
+  const visibleOptions = options.filter(
+    (option) => option.id !== "audio" || runtime?.platform === "win32"
+  );
+
+  useEffect(() => {
+    if (runtime && runtime.platform !== "win32" && accentSource === "audio") {
+      setAccentSource("artwork");
+    }
+  }, [accentSource, runtime, setAccentSource]);
 
   return (
     <SectionCard>
@@ -4985,8 +5038,13 @@ function AppearanceCard() {
       <p className="text-sm leading-6 text-[var(--muted)]">
         The interface stays monotone and borrows one accent colour from whatever is playing.
       </p>
-      <div className="mt-5 grid grid-cols-3 gap-3">
-        {options.map((option) => (
+      <div
+        className={cn(
+          "mt-5 grid gap-3",
+          visibleOptions.length === 3 ? "grid-cols-3" : "grid-cols-2"
+        )}
+      >
+        {visibleOptions.map((option) => (
           <button
             key={option.id}
             type="button"
@@ -5174,19 +5232,20 @@ function StatsPage() {
   }
 
   const maxArtist = stats.topArtists[0]?.count ?? 1;
-  const providerTotal = Math.max(1, stats.providerSplit.spotify + stats.providerSplit.soundcloud);
-  // Round one side and derive the other so the split always reads as exactly 100%.
-  const spotifyPct = Math.round((stats.providerSplit.spotify / providerTotal) * 100);
-  const soundcloudPct = 100 - spotifyPct;
+  const providerTotal = Math.max(1, stats.totalPlays);
+  const providerPct = (provider: keyof ListeningStats["providerSplit"]) =>
+    Math.round((stats.providerSplit[provider] / providerTotal) * 100);
   const maxDay = Math.max(1, ...stats.days.map((day) => day.count));
 
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
         <StatTile label="Tracks played" value={stats.totalPlays.toLocaleString()} />
         <StatTile label="Last 7 days" value={stats.weekPlays.toLocaleString()} />
-        <StatTile label="Spotify" value={`${spotifyPct}%`} accent="var(--spotify-tint)" />
-        <StatTile label="SoundCloud" value={`${soundcloudPct}%`} accent="var(--soundcloud-tint)" />
+        <StatTile label="Spotify" value={`${providerPct("spotify")}%`} accent="var(--spotify-tint)" />
+        <StatTile label="SoundCloud" value={`${providerPct("soundcloud")}%`} accent="var(--soundcloud-tint)" />
+        <StatTile label="YouTube" value={`${providerPct("youtube")}%`} />
+        <StatTile label="Local" value={`${providerPct("local")}%`} />
       </div>
 
       <SectionCard>
@@ -5261,6 +5320,7 @@ function StatsPage() {
         onCancel={() => setConfirmClear(false)}
         onConfirm={() => {
           clearListeningStats();
+          useAppStore.setState({ recentTracks: [] });
           setVersion((value) => value + 1);
           setConfirmClear(false);
         }}
@@ -5284,8 +5344,6 @@ function SettingsPage() {
   const refreshProviderConnection = useAppStore((state) => state.refreshProviderConnection);
   const hydrateLibraries = useAppStore((state) => state.hydrateLibraries);
   const restartOnboarding = useAppStore((state) => state.restartOnboarding);
-  const appEnv = getAppEnv();
-  const showDeveloperTools = appEnv.enableSelfHostSetup;
   const [consentProvider, setConsentProvider] = useState<OAuthProvider | null>(null);
   const [confirmRestart, setConfirmRestart] = useState(false);
   const [configForm, setConfigForm] = useState(desktopConfig);
@@ -5497,8 +5555,8 @@ function SettingsPage() {
             </div>
             <p className="mt-4 flex items-start gap-2 text-xs leading-5 text-[var(--muted)]">
               <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              Protected playback is signed (castLabs VMP, ~4 years). Re-signed builds ship before it
-              lapses — nothing you need to do.
+              Encrypted SoundCloud playback requires an installer whose VMP signatures were verified
+              during release. Unsigned builds cannot play those tracks.
             </p>
           </SectionCard>
 
@@ -5518,12 +5576,12 @@ function SettingsPage() {
             </div>
           </SectionCard>
 
-          {showDeveloperTools ? (
+          {
             <SectionCard>
-              <SectionHeader title="Bundled OAuth overrides" />
+              <SectionHeader title="Connection credentials" />
               <p className="text-sm leading-6 text-[var(--muted)]">
-                Only visible with the developer flag enabled. Packaged builds never need manual
-                credentials.
+                Add your own Spotify or SoundCloud app credentials. The SoundCloud secret is stored
+                with the operating system's secure storage and is never returned to this form.
               </p>
 
               <div className="mt-6 space-y-4">
@@ -5544,22 +5602,41 @@ function SettingsPage() {
                   className="w-full rounded-[var(--radius-lg)] border border-[var(--edge)] bg-[var(--panel)] px-4 py-3 text-sm text-[var(--paper)] outline-none"
                 />
                 <input
+                  type="password"
                   value={configForm.soundCloudClientSecret}
                   onChange={(event) =>
                     setConfigForm((current) => ({ ...current, soundCloudClientSecret: event.target.value }))
                   }
-                  placeholder="SOUNDCLOUD_CLIENT_SECRET"
+                  placeholder={
+                    configForm.soundCloudClientSecretConfigured
+                      ? "SoundCloud secret configured — enter a replacement"
+                      : "SOUNDCLOUD_CLIENT_SECRET"
+                  }
                   className="w-full rounded-[var(--radius-lg)] border border-[var(--edge)] bg-[var(--panel)] px-4 py-3 text-sm text-[var(--paper)] outline-none"
                 />
               </div>
 
               <div className="mt-5 flex flex-wrap gap-3">
                 <Btn kind="primary" onClick={() => void saveDesktopConfig(configForm)}>
-                  Save overrides
+                  Save credentials
                 </Btn>
+                {configForm.soundCloudClientSecretConfigured ? (
+                  <Btn
+                    kind="secondary"
+                    onClick={() =>
+                      void saveDesktopConfig({
+                        ...configForm,
+                        soundCloudClientSecret: "",
+                        soundCloudClientSecretConfigured: false
+                      })
+                    }
+                  >
+                    Clear SoundCloud secret
+                  </Btn>
+                ) : null}
               </div>
             </SectionCard>
-          ) : null}
+          }
         </div>
       </div>
 

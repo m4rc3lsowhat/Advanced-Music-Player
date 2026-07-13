@@ -15,7 +15,10 @@ function isTrackEventForCurrentTrack(
   activeTrackId: string | undefined,
   currentTrack: UnifiedTrack | undefined
 ): boolean {
-  if (!activeTrackId || !currentTrack) {
+  if (!currentTrack) {
+    return false;
+  }
+  if (!activeTrackId) {
     return true;
   }
 
@@ -40,6 +43,7 @@ export class QueueEngine {
    * behind the other (which would stall, e.g., a SoundCloud play behind a slow Spotify start).
    */
   private playGeneration = 0;
+  private transportIntent: "play" | "pause" | "stop" = "stop";
 
   constructor(adapters: PlaybackAdapter[] = []) {
     adapters.forEach((adapter) => this.registerAdapter(adapter));
@@ -67,7 +71,7 @@ export class QueueEngine {
   setQueue(queue: UnifiedTrack[], startIndex = 0): void {
     const safeIndex = queue.length === 0 ? -1 : Math.max(0, Math.min(startIndex, queue.length - 1));
     this.patchState({
-      queue,
+      queue: [...queue],
       currentIndex: safeIndex,
       activeProvider: queue[safeIndex]?.provider,
       durationMs: queue[safeIndex]?.durationMs ?? 0,
@@ -96,7 +100,7 @@ export class QueueEngine {
    */
   reorderQueue(queue: UnifiedTrack[], currentIndex: number): void {
     const safeIndex = queue.length === 0 ? -1 : Math.max(0, Math.min(currentIndex, queue.length - 1));
-    this.patchState({ queue, currentIndex: safeIndex });
+    this.patchState({ queue: [...queue], currentIndex: safeIndex });
   }
 
   /**
@@ -118,6 +122,8 @@ export class QueueEngine {
         return;
       }
       if (index >= queue.length) {
+        ++this.playGeneration;
+        this.transportIntent = "pause";
         // Removed the playing TAIL track: nothing slid into its slot, so pause at the (new) end
         // instead of audibly restarting the previous song. positionMs must reset too — resume()
         // replays from state.positionMs, which still holds the removed track's position.
@@ -126,6 +132,7 @@ export class QueueEngine {
         this.patchState({
           queue,
           currentIndex: queue.length - 1,
+          activeProvider: queue[queue.length - 1]?.provider,
           status: "paused",
           positionMs: 0,
           durationMs: queue[queue.length - 1]?.durationMs ?? 0
@@ -143,10 +150,12 @@ export class QueueEngine {
 
   async playAt(index = this.state.currentIndex, options?: { positionMs?: number }): Promise<void> {
     const generation = ++this.playGeneration;
+    this.transportIntent = "play";
     const superseded = () => generation !== this.playGeneration;
 
     const track = this.state.queue[index];
     if (!track) {
+      this.transportIntent = "stop";
       await this.teardownOthers(undefined);
       this.playingProvider = undefined;
       this.patchState({ status: "idle", currentIndex: -1, activeProvider: undefined });
@@ -203,13 +212,12 @@ export class QueueEngine {
       return;
     }
 
-    this.playingProvider = track.provider;
-    await adapter.preload?.(track);
-    if (superseded()) {
-      return;
-    }
-
     try {
+      this.playingProvider = track.provider;
+      await adapter.preload?.(track);
+      if (superseded()) {
+        return;
+      }
       await adapter.play(track, {
         queue: this.state.queue,
         startAt: index,
@@ -242,8 +250,32 @@ export class QueueEngine {
     // only if the newer one uses a DIFFERENT provider. If it reused this same adapter (e.g.
     // SoundCloud → SoundCloud), that adapter is already playing the new track, and tearing it down
     // would wrongly kill it.
-    if (superseded() && this.playingProvider !== track.provider) {
-      await adapter.teardown();
+    if (superseded()) {
+      const currentTrack = this.state.queue[this.state.currentIndex];
+      if (
+        this.playingProvider === track.provider &&
+        currentTrack?.provider === track.provider
+      ) {
+        const intent = this.transportIntent as "play" | "pause" | "stop";
+        if (intent === "pause") {
+          await adapter.pause();
+        } else if (intent === "stop") {
+          await adapter.teardown();
+        } else if (
+          this.state.status === "playing" &&
+          currentTrack.providerTrackId !== track.providerTrackId
+        ) {
+          // A slower same-provider play resolved after the newer one and may have replaced the
+          // adapter's output. Reassert the track the engine still considers current.
+          await adapter.play(currentTrack, {
+            queue: this.state.queue,
+            startAt: this.state.currentIndex,
+            positionMs: this.state.positionMs
+          });
+        }
+      } else {
+        await adapter.teardown();
+      }
     }
   }
 
@@ -261,12 +293,18 @@ export class QueueEngine {
   }
 
   async pause(): Promise<void> {
+    const generation = ++this.playGeneration;
+    this.transportIntent = "pause";
     const adapter = this.getActiveAdapter();
     if (!adapter) {
       return;
     }
 
     await adapter.pause();
+    if (generation !== this.playGeneration) {
+      await this.restoreLatestPlayIntent(adapter);
+      return;
+    }
     this.patchState({ status: "paused" });
   }
 
@@ -289,7 +327,6 @@ export class QueueEngine {
 
   async next(): Promise<void> {
     if (!this.state.canGoNext) {
-      this.patchState({ status: "paused" });
       return;
     }
 
@@ -310,8 +347,31 @@ export class QueueEngine {
       return;
     }
 
+    const generation = this.playGeneration;
+    const trackId = this.state.queue[this.state.currentIndex]?.providerTrackId;
     this.patchState({ positionMs });
     await adapter.seek(positionMs);
+    if (
+      generation !== this.playGeneration ||
+      this.state.queue[this.state.currentIndex]?.providerTrackId !== trackId
+    ) {
+      await this.restoreLatestPlayIntent(adapter);
+    }
+  }
+
+  private async restoreLatestPlayIntent(adapter: PlaybackAdapter): Promise<void> {
+    if (this.transportIntent !== "play" || this.state.status !== "playing") {
+      return;
+    }
+    const currentTrack = this.state.queue[this.state.currentIndex];
+    if (!currentTrack || currentTrack.provider !== adapter.provider) {
+      return;
+    }
+    await adapter.play(currentTrack, {
+      queue: this.state.queue,
+      startAt: this.state.currentIndex,
+      positionMs: this.state.positionMs
+    });
   }
 
   async setVolume(volume: number): Promise<void> {
@@ -355,6 +415,8 @@ export class QueueEngine {
   }
 
   async teardown(): Promise<void> {
+    ++this.playGeneration;
+    this.transportIntent = "stop";
     const { volume, providerVolumes } = this.state;
     this.playingProvider = undefined;
     await Promise.all(Array.from(this.adapters.values()).map((adapter) => adapter.teardown()));
@@ -382,7 +444,14 @@ export class QueueEngine {
     }
 
     if (event.type === "ended") {
-      void this.next();
+      if (this.state.canGoNext) {
+        void this.next();
+      } else {
+        this.patchState({
+          status: "paused",
+          positionMs: event.snapshot.durationMs || this.state.durationMs
+        });
+      }
       return;
     }
 
@@ -420,8 +489,12 @@ export class QueueEngine {
       ...partial
     });
 
-    for (const listener of this.listeners) {
-      listener(this.state);
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(this.state);
+      } catch {
+        // Listener failures are UI/integration failures, not playback transport failures.
+      }
     }
   }
 }

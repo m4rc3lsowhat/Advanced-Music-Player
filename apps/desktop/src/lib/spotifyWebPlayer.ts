@@ -50,6 +50,7 @@ let sdkLoad: Promise<void> | undefined;
 let devicePromise: Promise<string> | undefined;
 let player: SpotifyPlayerInstance | undefined;
 let cachedDeviceId: string | undefined;
+let deviceGeneration = 0;
 const stateListeners = new Set<(state: SpotifyPlaybackState | null) => void>();
 
 /** Inject the Spotify SDK script once and resolve when it signals ready. */
@@ -98,19 +99,36 @@ export function ensureSpotifyWebDevice(getToken: TokenProvider): Promise<string>
     return devicePromise;
   }
 
-  devicePromise = (async () => {
+  const generation = deviceGeneration;
+  const pending = (async () => {
     await loadSdk();
+    if (generation !== deviceGeneration) {
+      throw new Error("Spotify player initialization was cancelled.");
+    }
     if (!window.Spotify) {
       throw new Error("Spotify Web Playback SDK unavailable.");
     }
 
     return await new Promise<string>((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        reject(new Error("The in-app Spotify player did not start in time."));
-      }, READY_TIMEOUT_MS);
+      let settled = false;
+      let timer: number;
 
       const fail = (message: string) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         window.clearTimeout(timer);
+        try {
+          instance.disconnect();
+        } catch {
+          // best-effort
+        }
+        if (player === instance) {
+          player = undefined;
+          cachedDeviceId = undefined;
+        }
+        devicePromise = undefined;
         reject(new Error(message));
       };
 
@@ -121,23 +139,49 @@ export function ensureSpotifyWebDevice(getToken: TokenProvider): Promise<string>
           // Called on init and again whenever the SDK needs a fresh token; getToken
           // already refreshes, so this keeps the device authenticated indefinitely.
           void getToken().then((token) => {
-            if (token) {
+            if (token && !settled && generation === deviceGeneration) {
               cb(token);
             }
           });
         }
       });
 
+      timer = window.setTimeout(() => {
+        fail("The in-app Spotify player did not start in time.");
+      }, READY_TIMEOUT_MS);
+
       instance.addListener("ready", ({ device_id }: { device_id: string }) => {
+        if (generation !== deviceGeneration) {
+          fail("Spotify player initialization was cancelled.");
+          return;
+        }
+        if (settled) {
+          return;
+        }
+        settled = true;
         window.clearTimeout(timer);
         cachedDeviceId = device_id;
         player = instance;
+        // Only cache connection work while it is pending. Once ready, cachedDeviceId is the cache;
+        // retaining a resolved promise would return an offline id after a later not_ready event.
+        devicePromise = undefined;
         resolve(device_id);
       });
       instance.addListener("not_ready", () => {
-        // Device went offline (token lapse / network); drop the cache so the next
-        // play() rebuilds it.
-        cachedDeviceId = undefined;
+        if (!settled) {
+          fail("The in-app Spotify player went offline before it was ready.");
+          return;
+        }
+        if (player === instance) {
+          try {
+            instance.disconnect();
+          } catch {
+            // best-effort
+          }
+          player = undefined;
+          cachedDeviceId = undefined;
+          devicePromise = undefined;
+        }
       });
       instance.addListener("initialization_error", ({ message }: { message: string }) => {
         fail(`Spotify player init failed: ${message}`);
@@ -156,19 +200,24 @@ export function ensureSpotifyWebDevice(getToken: TokenProvider): Promise<string>
       });
 
       void instance.connect().then((ok) => {
-        if (!ok) {
+        if (generation !== deviceGeneration) {
+          fail("Spotify player initialization was cancelled.");
+        } else if (!ok) {
           fail("The in-app Spotify player could not connect.");
         }
       });
     });
   })();
+  devicePromise = pending;
 
   // On failure, clear the cached promise so a later play() can retry from scratch.
-  devicePromise.catch(() => {
-    devicePromise = undefined;
+  void pending.catch(() => {
+    if (devicePromise === pending) {
+      devicePromise = undefined;
+    }
   });
 
-  return devicePromise;
+  return pending;
 }
 
 export function getSpotifyWebDeviceId(): string | undefined {
@@ -233,6 +282,7 @@ export async function setSpotifyPlayerPosition(positionMs: number): Promise<void
 }
 
 export function teardownSpotifyWebDevice(): void {
+  deviceGeneration += 1;
   try {
     player?.disconnect();
   } catch {

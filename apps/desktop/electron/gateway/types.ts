@@ -29,6 +29,7 @@ export interface StealthRequestInit {
   headers?: Record<string, string>;
   body?: string;
   timeoutMs?: number;
+  redirect?: "follow" | "error" | "manual";
 }
 
 export interface StealthResponse {

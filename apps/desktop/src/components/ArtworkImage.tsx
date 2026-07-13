@@ -20,7 +20,9 @@ export function ArtworkImage({ track, alt = "", className }: ArtworkImageProps) 
     () => createArtworkFallbackDataUrl(track.provider, { title: track.title, creators: track.creators }),
     [track.provider, track.title, track.creators]
   );
-  const [source, setSource] = useState(track.artworkUrl ?? fallback);
+  const [source, setSource] = useState(
+    isRemoteUrl(track.artworkUrl) ? fallback : (track.artworkUrl ?? fallback)
+  );
   const imgRef = useRef<HTMLImageElement>(null);
   const [visible, setVisible] = useState(false);
 
@@ -54,14 +56,14 @@ export function ArtworkImage({ track, alt = "", className }: ArtworkImageProps) 
     }
 
     let active = true;
-    const directSource = track.artworkUrl ?? fallback;
-    setSource(directSource);
-
     if (!isRemoteUrl(track.artworkUrl)) {
+      setSource(track.artworkUrl ?? fallback);
       return () => {
         active = false;
       };
     }
+
+    setSource(fallback);
 
     void resolveArtwork({
       // Key the cache by the artwork URL so a higher-res variant fetches fresh instead of serving
@@ -85,6 +87,8 @@ export function ArtworkImage({ track, alt = "", className }: ArtworkImageProps) 
       src={source}
       alt={alt}
       className={className}
+      loading="lazy"
+      decoding="async"
       onError={() => setSource(fallback)}
     />
   );

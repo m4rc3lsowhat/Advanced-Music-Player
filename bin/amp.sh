@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ---- AMP launcher (macOS / Linux) ----
+# ---- AMP packaged launcher (macOS) ----
 # Run this to start AMP. First run builds the packaged app; later runs launch instantly.
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

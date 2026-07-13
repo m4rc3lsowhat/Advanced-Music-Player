@@ -1,4 +1,4 @@
-import { promises as fs, writeFileSync } from "node:fs";
+import { promises as fs, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { CacheEntry } from "./types";
 
@@ -12,8 +12,12 @@ const LOW_WATER_ENTRIES = 480;
 export class CacheStore {
   private cacheDir: string;
   private memoryCache = new Map<string, CacheEntry>();
+  private memoryOnlyKeys = new Set<string>();
   private dirty = false;
+  private revision = 0;
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
+  private flushQueue: Promise<void> = Promise.resolve();
+  private writeGeneration = 0;
 
   constructor(userDataPath: string) {
     this.cacheDir = path.join(userDataPath, "gateway-cache");
@@ -31,7 +35,9 @@ export class CacheStore {
     }
     if (entry.expiresAt <= Date.now()) {
       this.memoryCache.delete(key);
+      this.memoryOnlyKeys.delete(key);
       this.dirty = true;
+      this.revision += 1;
       this.scheduleFlush();
       return undefined;
     }
@@ -39,6 +45,17 @@ export class CacheStore {
   }
 
   set(key: string, data: unknown, ttlMs: number, etag?: string): void {
+    this.memoryOnlyKeys.delete(key);
+    this.storeEntry(key, data, ttlMs, etag);
+  }
+
+  /** Cache credentials and signed media URLs for this process without writing them to disk. */
+  setMemoryOnly(key: string, data: unknown, ttlMs: number, etag?: string): void {
+    this.memoryOnlyKeys.add(key);
+    this.storeEntry(key, data, ttlMs, etag);
+  }
+
+  private storeEntry(key: string, data: unknown, ttlMs: number, etag?: string): void {
     const now = Date.now();
     this.memoryCache.set(key, {
       key,
@@ -51,6 +68,7 @@ export class CacheStore {
       this.evictStale(now);
     }
     this.dirty = true;
+    this.revision += 1;
     this.scheduleFlush();
   }
 
@@ -59,6 +77,7 @@ export class CacheStore {
     for (const [key, entry] of this.memoryCache) {
       if (entry.expiresAt <= now) {
         this.memoryCache.delete(key);
+        this.memoryOnlyKeys.delete(key);
       }
     }
     if (this.memoryCache.size <= MAX_ENTRIES) {
@@ -67,13 +86,16 @@ export class CacheStore {
     const oldestFirst = [...this.memoryCache.values()].sort((a, b) => a.createdAt - b.createdAt);
     for (const entry of oldestFirst.slice(0, this.memoryCache.size - LOW_WATER_ENTRIES)) {
       this.memoryCache.delete(entry.key);
+      this.memoryOnlyKeys.delete(entry.key);
     }
   }
 
   invalidate(pattern?: RegExp): void {
     if (!pattern) {
       this.memoryCache.clear();
+      this.memoryOnlyKeys.clear();
       this.dirty = true;
+      this.revision += 1;
       this.scheduleFlush();
       return;
     }
@@ -81,7 +103,9 @@ export class CacheStore {
     for (const key of this.memoryCache.keys()) {
       if (pattern.test(key)) {
         this.memoryCache.delete(key);
+        this.memoryOnlyKeys.delete(key);
         this.dirty = true;
+        this.revision += 1;
       }
     }
     this.scheduleFlush();
@@ -92,8 +116,20 @@ export class CacheStore {
       clearTimeout(this.flushTimer);
     }
     this.flushTimer = setTimeout(() => {
-      void this.flush();
+      this.flushTimer = undefined;
+      this.flush();
     }, 2000);
+  }
+
+  private writeSnapshotSync(entries: CacheEntry[]): void {
+    const targetPath = path.join(this.cacheDir, "store.json");
+    const temporaryPath = `${targetPath}.${process.pid}.sync.${Date.now()}.tmp`;
+    try {
+      writeFileSync(temporaryPath, JSON.stringify(entries, null, 2), "utf8");
+      renameSync(temporaryPath, targetPath);
+    } finally {
+      rmSync(temporaryPath, { force: true });
+    }
   }
 
   /**
@@ -110,29 +146,57 @@ export class CacheStore {
       return;
     }
     try {
+      this.writeGeneration += 1;
+      const revision = this.revision;
       const now = Date.now();
-      const entries = Array.from(this.memoryCache.values()).filter((entry) => entry.expiresAt > now);
-      writeFileSync(path.join(this.cacheDir, "store.json"), JSON.stringify(entries, null, 2), "utf8");
-      this.dirty = false;
+      const entries = Array.from(this.memoryCache.values()).filter(
+        (entry) => entry.expiresAt > now && !this.memoryOnlyKeys.has(entry.key)
+      );
+      this.writeSnapshotSync(entries);
+      if (this.revision === revision) {
+        this.dirty = false;
+      }
     } catch {
       // Cache flush failure is non-critical.
     }
   }
 
-  private async flush(): Promise<void> {
+  private flush(): void {
     if (!this.dirty) {
       return;
     }
 
-    try {
-      const now = Date.now();
-      const entries = Array.from(this.memoryCache.values()).filter((entry) => entry.expiresAt > now);
-      const payload = JSON.stringify(entries, null, 2);
-      await fs.writeFile(path.join(this.cacheDir, "store.json"), payload, "utf8");
-      this.dirty = false;
-    } catch {
-      // Cache flush failure is non-critical.
-    }
+    const revision = this.revision;
+    const generation = ++this.writeGeneration;
+    const now = Date.now();
+    const entries = Array.from(this.memoryCache.values()).filter(
+      (entry) => entry.expiresAt > now && !this.memoryOnlyKeys.has(entry.key)
+    );
+    const payload = JSON.stringify(entries, null, 2);
+    const targetPath = path.join(this.cacheDir, "store.json");
+    const temporaryPath = `${targetPath}.${process.pid}.${generation}.tmp`;
+
+    const run = this.flushQueue.then(async () => {
+      try {
+        await fs.writeFile(temporaryPath, payload, "utf8");
+        // renameSync runs in this continuation without an await between the generation check and
+        // replace. flushNow can therefore invalidate a pending snapshot without a stale async
+        // rename landing after the quit-time write.
+        if (generation === this.writeGeneration) {
+          renameSync(temporaryPath, targetPath);
+          if (this.revision === revision) {
+            this.dirty = false;
+          } else {
+            this.scheduleFlush();
+          }
+        }
+      } catch {
+        // Cache flush failure is non-critical; keep dirty so a later mutation can retry.
+      } finally {
+        await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+      }
+    });
+    this.flushQueue = run.catch(() => undefined);
   }
 
   private async hydrate(): Promise<void> {
@@ -140,11 +204,23 @@ export class CacheStore {
       const raw = await fs.readFile(path.join(this.cacheDir, "store.json"), "utf8");
       const entries = JSON.parse(raw) as CacheEntry[];
       const now = Date.now();
+      let scrubbedSensitiveEntry = false;
 
       for (const entry of entries) {
+        // Older releases persisted signed SoundCloud URLs and DRM/OAuth material in store.json.
+        // Never hydrate those values and rewrite the store without them.
+        if (entry.key.startsWith("soundcloud:stream:")) {
+          scrubbedSensitiveEntry = true;
+          continue;
+        }
         if (entry.expiresAt > now) {
           this.memoryCache.set(entry.key, entry);
         }
+      }
+      if (scrubbedSensitiveEntry) {
+        this.dirty = true;
+        this.revision += 1;
+        this.scheduleFlush();
       }
     } catch {
       // Hydration failure is fine on first run.

@@ -83,6 +83,8 @@ import {
   detectScript,
   excludeArtist,
   limitPerArtist,
+  libraryMixFingerprint,
+  localDateKey,
   normalizeArtist,
   pickBestTwin,
   primaryArtist,
@@ -104,6 +106,7 @@ import { SoundCloudPlaybackAdapter } from "@/lib/providers/soundcloudAdapter";
 import { createSpotifyAdapter } from "@/lib/providers/createSpotifyAdapter";
 import { createLocalAdapter, type HtmlAudioAdapter } from "@/lib/providers/htmlAudioAdapter";
 import { YouTubeIframeAdapter } from "@/lib/providers/youtubeIframeAdapter";
+import { teardownSpotifyWebDevice } from "@/lib/spotifyWebPlayer";
 import {
   addLocalMusicFolder,
   listLocalMusicFolders,
@@ -183,6 +186,7 @@ export interface AlbumView {
 interface AppState {
   initialized: boolean;
   initializing: boolean;
+  initializationError?: string;
   /** Human-readable boot stage + progress (0..1), updated during initialize() for the splash bar. */
   bootStage: string;
   bootProgress: number;
@@ -197,6 +201,7 @@ interface AppState {
   /** Artist-anchored Daily Mixes for the current day, plus the date they were generated for. */
   dailyMixes: HomeMix[];
   dailyMixesDate?: string;
+  dailyMixesLibraryFingerprint?: string;
   mixesStatus: "idle" | "loading" | "ready";
   /** The mix currently opened in the Mix detail view (Daily Mix, blend or station). */
   activeMix?: HomeMix;
@@ -582,21 +587,56 @@ export const useAppStore = create<AppState>((set, get) => {
   // matter which network call settles last (rapid "Go to artist" clicks must never flip back).
   let activeArtistRequest = 0;
   let activeAlbumRequest = 0;
+  let activePlayRequest = 0;
+  const providerSessionGeneration: Record<Provider, number> = {
+    spotify: 0,
+    soundcloud: 0,
+    youtube: 0,
+    local: 0
+  };
+  const providerCollectionRequest: Record<Provider, number> = {
+    spotify: 0,
+    soundcloud: 0,
+    youtube: 0,
+    local: 0
+  };
   let lastLibraryHydrateSignature = "";
   let spotifyAdapter: SpotifyBaseAdapter | null = null;
   let soundCloudAdapter: SoundCloudPlaybackAdapter | null = null;
   let youTubeAdapter: YouTubeIframeAdapter | null = null;
   let localAdapter: HtmlAudioAdapter | null = null;
-  // De-dupes play logging in the queue subscription (a track emits "playing" many times).
-  let lastLoggedPlayKey = "";
+  // A play qualifies for history only after meaningful listening, not on the adapter's first
+  // "playing" event. Position deltas ignore seeks and survive pause/resume.
+  let statsTrackKey = "";
+  let statsQueueIndex = -1;
+  let statsListenedMs = 0;
+  let statsLastPositionMs = 0;
+  let statsPlayLogged = false;
   // In-flight guards: `force` may bypass the freshness check but never overlaps a running build.
   let dailyMixesBuilding = false;
-  let stationBuilding = false;
+  let stationRequestId = 0;
 
   const persistPlaylist = async (playlist: UnifiedPlaylist) => {
     await upsertPlaylist(playlist);
     const playlists = get().playlists.filter((item) => item.id !== playlist.id);
     set({ playlists: [playlist, ...playlists] });
+  };
+
+  const playlistMutationQueues = new Map<string, Promise<unknown>>();
+  const runPlaylistMutation = async <T>(playlistId: string, mutation: () => Promise<T>): Promise<T | undefined> => {
+    const previous = playlistMutationQueues.get(playlistId) ?? Promise.resolve();
+    const run = previous.catch(() => undefined).then(mutation);
+    playlistMutationQueues.set(playlistId, run);
+    try {
+      return await run;
+    } catch (error) {
+      set({ notice: getErrorMessage(error, "Could not save the playlist change.") });
+      return undefined;
+    } finally {
+      if (playlistMutationQueues.get(playlistId) === run) {
+        playlistMutationQueues.delete(playlistId);
+      }
+    }
   };
 
   const syncDesktopRuntime = async () => {
@@ -762,10 +802,28 @@ export const useAppStore = create<AppState>((set, get) => {
       // here (not in playTrack) means queue auto-advance and next/previous skips count too —
       // logging only manual plays badly undercounted top artists/tracks.
       const current = playback.queue[playback.currentIndex];
-      if (current && playback.status === "playing") {
+      if (current) {
         const key = getTrackKey(current);
-        if (key !== lastLoggedPlayKey) {
-          lastLoggedPlayKey = key;
+        if (key !== statsTrackKey || playback.currentIndex !== statsQueueIndex) {
+          statsTrackKey = key;
+          statsQueueIndex = playback.currentIndex;
+          statsListenedMs = 0;
+          statsLastPositionMs = playback.positionMs;
+          statsPlayLogged = false;
+        }
+
+        if (playback.status === "playing") {
+          const positionDelta = playback.positionMs - statsLastPositionMs;
+          if (positionDelta > 0 && positionDelta <= 5_000) {
+            statsListenedMs += positionDelta;
+          }
+          statsLastPositionMs = playback.positionMs;
+        }
+
+        const qualifiedAtMs =
+          playback.durationMs > 0 ? Math.min(30_000, playback.durationMs * 0.5) : 30_000;
+        if (!statsPlayLogged && statsListenedMs >= qualifiedAtMs) {
+          statsPlayLogged = true;
           recordPlay(current);
           const nextRecentTracks = dedupeTracks([current, ...get().recentTracks]).slice(0, 12);
           set({ recentTracks: nextRecentTracks });
@@ -819,15 +877,30 @@ export const useAppStore = create<AppState>((set, get) => {
     });
   };
 
-  const loadProviderCollection = async (provider: Provider, collectionId: string) => {
+  const loadProviderCollection = async (provider: Provider, collectionId: string, requestId: number) => {
     const adapter = getProviderAdapter(provider);
+    const sessionGeneration = providerSessionGeneration[provider];
     if (!adapter) {
-      applyFallbackStateForProvider(provider);
+      if (requestId === providerCollectionRequest[provider]) {
+        applyFallbackStateForProvider(provider);
+      }
       return;
     }
 
     const collection = await adapter.getCollectionTracks(collectionId);
+    if (
+      requestId !== providerCollectionRequest[provider] ||
+      sessionGeneration !== providerSessionGeneration[provider]
+    ) {
+      return;
+    }
     const importedTracks = await ingestTracks(collection.items, "library-sync");
+    if (
+      requestId !== providerCollectionRequest[provider] ||
+      sessionGeneration !== providerSessionGeneration[provider]
+    ) {
+      return;
+    }
 
     set((state) => ({
       libraries: {
@@ -994,6 +1067,7 @@ export const useAppStore = create<AppState>((set, get) => {
         playlistsCount?: number;
         lastSyncedAt?: string;
       };
+      sessionGeneration?: number;
     }
   ) => {
     const likeTracks = profile.likes ?? [];
@@ -1030,6 +1104,13 @@ export const useAppStore = create<AppState>((set, get) => {
       playlistsCount: String(options.stats?.playlistsCount ?? profile.playlists?.length ?? 0),
       lastSyncedAt: options.stats?.lastSyncedAt ?? connectionMetadata.lastSyncedAt ?? now
     };
+
+    if (
+      options.sessionGeneration !== undefined &&
+      options.sessionGeneration !== providerSessionGeneration.soundcloud
+    ) {
+      return false;
+    }
 
     set((current) => ({
       connections: {
@@ -1071,6 +1152,7 @@ export const useAppStore = create<AppState>((set, get) => {
           ? current.notice
           : `Loaded ${likeTracks.length} liked track${likeTracks.length === 1 ? "" : "s"} from SoundCloud.`
     }));
+    return true;
   };
 
   const setSoundCloudConnecting = () => {
@@ -1162,12 +1244,14 @@ export const useAppStore = create<AppState>((set, get) => {
   return {
     initialized: false,
     initializing: false,
+    initializationError: undefined,
     bootStage: "Starting AMP",
     bootProgress: 0,
     desktopConfig: {
       spotifyClientId: "",
       soundCloudClientId: "",
-      soundCloudClientSecret: ""
+      soundCloudClientSecret: "",
+      soundCloudClientSecretConfigured: false
     },
     connections: createDefaultConnections(),
     projectTracks: [],
@@ -1175,6 +1259,7 @@ export const useAppStore = create<AppState>((set, get) => {
     recentTracks: [],
     dailyMixes: [],
     dailyMixesDate: undefined,
+    dailyMixesLibraryFingerprint: undefined,
     mixesStatus: "idle",
     activeMix: undefined,
     trackMenu: undefined,
@@ -1205,8 +1290,14 @@ export const useAppStore = create<AppState>((set, get) => {
         return;
       }
 
-      set({ initializing: true, bootStage: "Starting AMP", bootProgress: 0.06 });
+      set({
+        initializing: true,
+        initializationError: undefined,
+        bootStage: "Starting AMP",
+        bootProgress: 0.06
+      });
       ensurePlayback();
+      let initializationSucceeded = false;
 
       try {
         set({ bootStage: "Connecting to desktop runtime", bootProgress: 0.18 });
@@ -1221,9 +1312,12 @@ export const useAppStore = create<AppState>((set, get) => {
         set({ bootStage: "Loading your SoundCloud likes", bootProgress: 0.92 });
         await restoreSoundCloudLibrary();
         set({ bootStage: "Ready", bootProgress: 1 });
+        initializationSucceeded = true;
       } catch (error) {
+        const message = error instanceof Error ? error.message : "AMP failed to initialize.";
         set({
-          notice: error instanceof Error ? error.message : "AMP failed to initialize."
+          notice: message,
+          initializationError: message
         });
       } finally {
         // First-run detection (tri-state flag). true = already finished setup → main app. false =
@@ -1245,7 +1339,11 @@ export const useAppStore = create<AppState>((set, get) => {
         if (onboardingComplete && storedOnboarding === undefined) {
           saveOnboardingComplete(true);
         }
-        set({ initialized: true, initializing: false, onboardingComplete });
+        set({
+          initialized: initializationSucceeded,
+          initializing: false,
+          onboardingComplete
+        });
       }
     },
 
@@ -1299,6 +1397,7 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     async selectProviderCollection(provider, collectionId) {
+      const requestId = ++providerCollectionRequest[provider];
       const connection = get().connections[provider];
       if (connection.status !== "connected") {
         set((state) => ({
@@ -1333,8 +1432,11 @@ export const useAppStore = create<AppState>((set, get) => {
       }));
 
       try {
-        await loadProviderCollection(provider, collectionId);
+        await loadProviderCollection(provider, collectionId, requestId);
       } catch (error) {
+        if (requestId !== providerCollectionRequest[provider]) {
+          return;
+        }
         set({
           notice:
             error instanceof Error
@@ -1342,6 +1444,9 @@ export const useAppStore = create<AppState>((set, get) => {
               : `${providerNames[provider]} collection could not be opened.`
         });
       } finally {
+        if (requestId !== providerCollectionRequest[provider]) {
+          return;
+        }
         set((state) => ({
           librarySync: {
             ...state.librarySync,
@@ -1355,6 +1460,7 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     async connectProvider(provider) {
+      const sessionGeneration = ++providerSessionGeneration[provider];
       const state = get();
       const missingConfigMessage = getMissingProviderConfigurationMessage(provider, state.runtime);
 
@@ -1387,6 +1493,9 @@ export const useAppStore = create<AppState>((set, get) => {
 
       try {
         const result = await connectDesktopProvider({ provider });
+        if (sessionGeneration !== providerSessionGeneration[provider]) {
+          return;
+        }
 
         const nextConnection: ProviderConnection = {
           provider,
@@ -1400,6 +1509,11 @@ export const useAppStore = create<AppState>((set, get) => {
           sessionSource: result.sessionSource,
           storageMode: result.storageMode
         };
+
+        if (provider === "spotify") {
+          spotifyAdapter?.clearAccountCaches();
+          set({ spotifyLikedTrackIds: new Set() });
+        }
 
         set((current) => {
           const nextConnections = {
@@ -1427,9 +1541,15 @@ export const useAppStore = create<AppState>((set, get) => {
         });
 
         const runtime = await reloadDesktopRuntime();
+        if (sessionGeneration !== providerSessionGeneration[provider]) {
+          return;
+        }
         set({ runtime });
         await get().hydrateLibraries(true);
       } catch (error) {
+        if (sessionGeneration !== providerSessionGeneration[provider]) {
+          return;
+        }
         const message = error instanceof Error ? error.message : "Connection failed.";
         // A user-cancelled sign-in isn't an error worth a red banner — just return the card to its
         // clean disconnected state so they can try again.
@@ -1451,13 +1571,34 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     async cancelConnectProvider(provider) {
-      // Resolve the in-flight wait in the main process. The pending connectProvider() promise then
-      // rejects with the cancel marker and its catch (above) resets the card to disconnected — so
-      // we deliberately don't set status here, keeping that catch the single source of truth.
+      providerSessionGeneration[provider] += 1;
+      providerCollectionRequest[provider] += 1;
       await cancelConnectDesktopProvider(provider);
+      set((state) => ({
+        connections: {
+          ...state.connections,
+          [provider]: createDefaultConnections()[provider]
+        },
+        librarySync: {
+          ...state.librarySync,
+          [provider]: { ...state.librarySync[provider], syncing: false }
+        }
+      }));
     },
 
     async disconnectProvider(provider) {
+      providerSessionGeneration[provider] += 1;
+      providerCollectionRequest[provider] += 1;
+      if (get().playback.activeProvider === provider) {
+        await queueEngine.pause().catch(() => undefined);
+      }
+      if (provider === "spotify") {
+        spotifyAdapter?.clearAccountCaches();
+        await spotifyAdapter?.teardown().catch(() => undefined);
+        teardownSpotifyWebDevice();
+      } else {
+        await soundCloudAdapter?.teardown().catch(() => undefined);
+      }
       try {
         if (provider === "soundcloud") {
           // If this was a legacy browser sign-in, clear that stored SoundCloud web session too.
@@ -1481,6 +1622,7 @@ export const useAppStore = create<AppState>((set, get) => {
       set((state) => ({
         runtime,
         connections: nextConnections,
+        ...(provider === "spotify" ? { spotifyLikedTrackIds: new Set<string>() } : {}),
         librarySync: {
           ...state.librarySync,
           [provider]: {
@@ -1500,7 +1642,11 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     async refreshProviderConnection(provider) {
+      const sessionGeneration = providerSessionGeneration[provider];
       const refreshed = await refreshStoredProviderSession({ provider });
+      if (sessionGeneration !== providerSessionGeneration[provider]) {
+        return get().connections[provider];
+      }
 
       const normalized = refreshed?.accessToken
         ? {
@@ -1534,6 +1680,9 @@ export const useAppStore = create<AppState>((set, get) => {
       }
 
       const runtime = await reloadDesktopRuntime();
+      if (sessionGeneration !== providerSessionGeneration[provider]) {
+        return get().connections[provider];
+      }
       set({ runtime });
       return normalized ?? get().connections[provider];
     },
@@ -1552,6 +1701,7 @@ export const useAppStore = create<AppState>((set, get) => {
       ensurePlayback();
 
       for (const provider of providers) {
+        const collectionRequestId = ++providerCollectionRequest[provider];
         const connection = get().connections[provider];
         set((state) => ({
           librarySync: {
@@ -1596,6 +1746,9 @@ export const useAppStore = create<AppState>((set, get) => {
           }
 
           const collections = await adapter.getCollections();
+          if (collectionRequestId !== providerCollectionRequest[provider]) {
+            continue;
+          }
           const currentSelection = get().selectedCollectionIds[provider];
           const nextSelection = collections.some((item) => item.id === currentSelection)
             ? currentSelection
@@ -1624,7 +1777,10 @@ export const useAppStore = create<AppState>((set, get) => {
           });
 
           if (nextSelection) {
-            await loadProviderCollection(provider, nextSelection);
+            await loadProviderCollection(provider, nextSelection, collectionRequestId);
+          }
+          if (collectionRequestId !== providerCollectionRequest[provider]) {
+            continue;
           }
 
           const importedCount = get().projectTracks.filter(
@@ -1644,6 +1800,9 @@ export const useAppStore = create<AppState>((set, get) => {
             }
           }));
         } catch (error) {
+          if (collectionRequestId !== providerCollectionRequest[provider]) {
+            continue;
+          }
           applyFallbackStateForProvider(provider);
           set((state) => ({
             librarySync: {
@@ -1663,9 +1822,17 @@ export const useAppStore = create<AppState>((set, get) => {
 
       // Populate Spotify "Liked Songs" state for the heart toggles (non-blocking).
       if (get().connections.spotify.status === "connected" && spotifyAdapter) {
+        const sessionGeneration = providerSessionGeneration.spotify;
         void spotifyAdapter
           .getSavedTrackIds()
-          .then((ids) => set({ spotifyLikedTrackIds: new Set(ids.map((id) => `spotify:${id}`)) }))
+          .then((ids) => {
+            if (
+              sessionGeneration === providerSessionGeneration.spotify &&
+              get().connections.spotify.status === "connected"
+            ) {
+              set({ spotifyLikedTrackIds: new Set(ids.map((id) => `spotify:${id}`)) });
+            }
+          })
           .catch(() => undefined);
       }
     },
@@ -1686,12 +1853,16 @@ export const useAppStore = create<AppState>((set, get) => {
         return;
       }
 
-      set({ searchStatus: "loading" });
+      set({ searchStatus: "loading", searchResults: [] });
       // Live network providers to query. Local files aren't a network target — they're matched
       // from the already-scanned library below (offline, instant).
       const networkTargets: Provider[] =
         provider === "all"
-          ? (["spotify", "soundcloud", "youtube"] as Provider[])
+          ? ([
+              ...(get().connections.spotify.status === "connected" ? (["spotify"] as Provider[]) : []),
+              "soundcloud",
+              "youtube"
+            ] as Provider[])
           : provider === "local"
             ? []
             : [provider];
@@ -1709,7 +1880,7 @@ export const useAppStore = create<AppState>((set, get) => {
         ? get().localTracks.filter((track) => isTrackMatch(track, trimmedQuery))
         : [];
 
-      const results: UnifiedTrack[] = [...catalogResults, ...localResults];
+      const results: UnifiedTrack[] = [...localResults];
       let failedTargets = 0;
 
       const adapterFor = (target: Provider) =>
@@ -1721,48 +1892,65 @@ export const useAppStore = create<AppState>((set, get) => {
               ? youTubeAdapter
               : null;
 
-      for (const target of networkTargets) {
-        if (requestId !== activeSearchRequest) {
-          return;
-        }
+      // Providers are independent; running them concurrently keeps all-provider search latency at
+      // the slowest provider instead of the sum of Spotify + SoundCloud + YouTube.
+      const providerSearches = await Promise.allSettled(
+        networkTargets.map(async (target) => {
+          const adapter = adapterFor(target);
+          if (!adapter) {
+            throw new Error(`${providerNames[target]} search isn't available right now.`);
+          }
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const tracks = await Promise.race([
+              adapter.search(trimmedQuery),
+              new Promise<never>((_, reject) => {
+                timeout = setTimeout(
+                  () => reject(new Error(`${providerNames[target]} search timed out. Try again.`)),
+                  10_000
+                );
+              })
+            ]);
+            return { target, tracks: tracks ?? [] };
+          } finally {
+            if (timeout) {
+              clearTimeout(timeout);
+            }
+          }
+        })
+      );
 
-        // SoundCloud + YouTube search anonymously; Spotify uses an anonymous token. We always try
-        // the live adapter and surface an honest error notice on failure rather than inventing hits.
-        const adapter = adapterFor(target);
-        if (!adapter) {
+      if (requestId !== activeSearchRequest) {
+        return;
+      }
+
+      const liveResults: UnifiedTrack[] = [];
+      let lastSearchError: string | undefined;
+      for (let index = 0; index < providerSearches.length; index += 1) {
+        const outcome = providerSearches[index];
+        if (outcome.status === "rejected") {
           failedTargets += 1;
-          set({ notice: `${providerNames[target]} search isn't available right now.` });
+          lastSearchError =
+            outcome.reason instanceof Error
+              ? outcome.reason.message
+              : `${providerNames[networkTargets[index]]} search failed. No results to show.`;
           continue;
         }
+        liveResults.push(...outcome.value.tracks);
+      }
 
-        try {
-          const providerResults = await adapter.search(trimmedQuery);
-          if (requestId !== activeSearchRequest) {
-            return;
-          }
-          // YouTube/local tracks are ephemeral (no persisted project record); only Spotify/SoundCloud
-          // results are ingested so their like/library plumbing keeps working.
-          const importedResults =
-            target === "youtube"
-              ? providerResults ?? []
-              : await ingestTracks(providerResults ?? [], "search");
-          results.push(...importedResults);
-        } catch (error) {
-          if (requestId !== activeSearchRequest) {
-            return;
-          }
-          failedTargets += 1;
-          set({
-            notice:
-              error instanceof Error
-                ? error.message
-                : `${providerNames[target]} search failed. No results to show.`
-          });
-        }
+      if (requestId !== activeSearchRequest) {
+        return;
+      }
+      // Search is read-only discovery. Persist a result only when the user plays, likes, or saves it;
+      // otherwise arbitrary queries overwrite library provenance and bloat local storage.
+      results.push(...liveResults, ...catalogResults.slice(0, 50));
+      if (lastSearchError) {
+        set({ notice: lastSearchError });
       }
 
       if (requestId === activeSearchRequest) {
-        const deduped = dedupeTracks(results);
+        const deduped = dedupeTracks(results).slice(0, 200);
         set({
           searchResults: deduped,
           // "error" only when every network provider failed AND nothing matched at all — partial
@@ -1848,68 +2036,86 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     async renamePlaylist(id, title) {
-      const playlist = get().playlists.find((item) => item.id === id);
-      if (!playlist) {
-        return;
-      }
-
-      await persistPlaylist({
-        ...playlist,
-        title,
-        updatedAt: new Date().toISOString()
+      await runPlaylistMutation(id, async () => {
+        const playlist = get().playlists.find((item) => item.id === id);
+        if (!playlist) {
+          return;
+        }
+        await persistPlaylist({
+          ...playlist,
+          title,
+          updatedAt: new Date().toISOString()
+        });
       });
     },
 
     async deletePlaylist(id) {
-      await deletePlaylistRecord(id);
-      set((state) => ({
-        playlists: state.playlists.filter((playlist) => playlist.id !== id),
-        selectedPlaylistId: state.selectedPlaylistId === id ? undefined : state.selectedPlaylistId
-      }));
+      await runPlaylistMutation(id, async () => {
+        await deletePlaylistRecord(id);
+        set((state) => ({
+          playlists: state.playlists.filter((playlist) => playlist.id !== id),
+          selectedPlaylistId: state.selectedPlaylistId === id ? undefined : state.selectedPlaylistId
+        }));
+      });
     },
 
     async addTrackToPlaylist(playlistId, track) {
-      const playlist = get().playlists.find((item) => item.id === playlistId);
-      if (!playlist) {
-        return;
+      const saved = await runPlaylistMutation(playlistId, async () => {
+        const linkedTrack = await ensureProjectTrack(track, "playlist");
+        const playlist = get().playlists.find((item) => item.id === playlistId);
+        if (!playlist) {
+          throw new Error("Playlist not found.");
+        }
+        const entry = createPlaylistEntry(playlistId, linkedTrack, playlist.entries.length);
+        await persistPlaylist({
+          ...playlist,
+          coverArtUrl: playlist.coverArtUrl ?? linkedTrack.artworkUrl,
+          entries: [...playlist.entries, entry],
+          updatedAt: new Date().toISOString()
+        });
+        set({ notice: `Added "${linkedTrack.title}" to ${playlist.title}.` });
+        return true;
+      });
+      if (!saved) {
+        throw new Error("Could not save the playlist change.");
       }
-
-      const linkedTrack = await ensureProjectTrack(track, "playlist");
-      const entry = createPlaylistEntry(playlistId, linkedTrack, playlist.entries.length);
-      const nextPlaylist: UnifiedPlaylist = {
-        ...playlist,
-        coverArtUrl: playlist.coverArtUrl ?? linkedTrack.artworkUrl,
-        entries: [...playlist.entries, entry],
-        updatedAt: new Date().toISOString()
-      };
-
-      await persistPlaylist(nextPlaylist);
-      set({ notice: `Added "${linkedTrack.title}" to ${playlist.title}.` });
     },
 
     async addTracksToPlaylist(playlistId, tracks) {
-      const playlist = get().playlists.find((item) => item.id === playlistId);
-      if (!playlist || tracks.length === 0) {
+      if (tracks.length === 0) {
         return;
       }
-
-      const entries = [...playlist.entries];
-      let coverArtUrl = playlist.coverArtUrl;
-      for (const track of tracks) {
-        const linkedTrack = await ensureProjectTrack(track, "playlist");
-        entries.push(createPlaylistEntry(playlistId, linkedTrack, entries.length));
-        coverArtUrl = coverArtUrl ?? linkedTrack.artworkUrl;
+      const saved = await runPlaylistMutation(playlistId, async () => {
+        const tracksToLink = tracks.filter(
+          (track) => !track.projectTrackId && track.provider !== "youtube" && track.provider !== "local"
+        );
+        const linkedTracks = await ingestTracks(tracksToLink, "playlist");
+        const linkedLookup = new Map(linkedTracks.map((track) => [getTrackKey(track), track]));
+        const resolvedTracks = tracks.map((track) => linkedLookup.get(getTrackKey(track)) ?? track);
+        const playlist = get().playlists.find((item) => item.id === playlistId);
+        if (!playlist) {
+          throw new Error("Playlist not found.");
+        }
+        const entries = [...playlist.entries];
+        let coverArtUrl = playlist.coverArtUrl;
+        for (const linkedTrack of resolvedTracks) {
+          entries.push(createPlaylistEntry(playlistId, linkedTrack, entries.length));
+          coverArtUrl = coverArtUrl ?? linkedTrack.artworkUrl;
+        }
+        await persistPlaylist({
+          ...playlist,
+          coverArtUrl,
+          entries,
+          updatedAt: new Date().toISOString()
+        });
+        set({
+          notice: `Added ${tracks.length} track${tracks.length === 1 ? "" : "s"} to ${playlist.title}.`
+        });
+        return true;
+      });
+      if (!saved) {
+        throw new Error("Could not save the playlist change.");
       }
-
-      await persistPlaylist({
-        ...playlist,
-        coverArtUrl,
-        entries,
-        updatedAt: new Date().toISOString()
-      });
-      set({
-        notice: `Added ${tracks.length} track${tracks.length === 1 ? "" : "s"} to ${playlist.title}.`
-      });
     },
 
     async importCollectionAsPlaylist(provider, collectionId, title) {
@@ -1926,8 +2132,18 @@ export const useAppStore = create<AppState>((set, get) => {
           return false;
         }
         const playlistId = await get().createPlaylist(title || collection.title || "Imported playlist");
-        await get().addTracksToPlaylist(playlistId, collection.items);
-        return true;
+        try {
+          await get().addTracksToPlaylist(playlistId, collection.items);
+          return true;
+        } catch (error) {
+          await deletePlaylistRecord(playlistId).catch(() => undefined);
+          set((state) => ({
+            playlists: state.playlists.filter((playlist) => playlist.id !== playlistId),
+            selectedPlaylistId:
+              state.selectedPlaylistId === playlistId ? undefined : state.selectedPlaylistId
+          }));
+          throw error;
+        }
       } catch (error) {
         set({ notice: error instanceof Error ? error.message : "Could not import that playlist." });
         return false;
@@ -1935,26 +2151,25 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     async removeTrackFromPlaylist(playlistId, entryId) {
-      const playlist = get().playlists.find((item) => item.id === playlistId);
-      if (!playlist) {
-        return;
-      }
-
-      const removedEntry = playlist.entries.find((entry) => entry.id === entryId);
-      const nextEntries = reorderPlaylistEntries(
-        playlist.entries.filter((entry) => entry.id !== entryId)
-      );
-
-      await persistPlaylist({
-        ...playlist,
-        coverArtUrl: nextEntries[0]?.track.artworkUrl,
-        entries: nextEntries,
-        updatedAt: new Date().toISOString()
+      await runPlaylistMutation(playlistId, async () => {
+        const playlist = get().playlists.find((item) => item.id === playlistId);
+        if (!playlist) {
+          return;
+        }
+        const removedEntry = playlist.entries.find((entry) => entry.id === entryId);
+        const nextEntries = reorderPlaylistEntries(
+          playlist.entries.filter((entry) => entry.id !== entryId)
+        );
+        await persistPlaylist({
+          ...playlist,
+          coverArtUrl: nextEntries[0]?.track.artworkUrl,
+          entries: nextEntries,
+          updatedAt: new Date().toISOString()
+        });
+        if (removedEntry) {
+          set({ notice: `Removed "${removedEntry.track.title}" from ${playlist.title}.` });
+        }
       });
-
-      if (removedEntry) {
-        set({ notice: `Removed "${removedEntry.track.title}" from ${playlist.title}.` });
-      }
     },
 
     async setSpotifyTrackLiked(track, liked) {
@@ -1965,8 +2180,15 @@ export const useAppStore = create<AppState>((set, get) => {
         set({ notice: "Connect Spotify in Settings to update your Liked Songs." });
         return;
       }
+      const sessionGeneration = providerSessionGeneration.spotify;
       try {
         await spotifyAdapter.setSaved(track, liked);
+        if (
+          sessionGeneration !== providerSessionGeneration.spotify ||
+          get().connections.spotify.status !== "connected"
+        ) {
+          return;
+        }
         set((state) => {
           const next = new Set(state.spotifyLikedTrackIds);
           const key = `spotify:${track.providerTrackId || track.id}`;
@@ -1988,6 +2210,7 @@ export const useAppStore = create<AppState>((set, get) => {
       }
 
       const connection = get().connections.soundcloud;
+      const sessionGeneration = providerSessionGeneration.soundcloud;
       if (
         connection.status !== "connected" ||
         (!["web-session", "local-connect"].includes(connection.metadata?.source ?? "") && !connection.accessToken)
@@ -2013,6 +2236,9 @@ export const useAppStore = create<AppState>((set, get) => {
               }
             });
       if (!result.ok) {
+        if (sessionGeneration !== providerSessionGeneration.soundcloud) {
+          return;
+        }
         set((state) => ({
           notice: result.error ?? "SoundCloud like update failed.",
           connections: {
@@ -2026,7 +2252,17 @@ export const useAppStore = create<AppState>((set, get) => {
         return;
       }
 
+      if (
+        sessionGeneration !== providerSessionGeneration.soundcloud ||
+        get().connections.soundcloud.status !== "connected"
+      ) {
+        return;
+      }
+
       const linkedTrack = liked ? await ensureProjectTrack(track, "library-sync") : track;
+      if (sessionGeneration !== providerSessionGeneration.soundcloud) {
+        return;
+      }
       const targetKey = getTrackKey(linkedTrack);
 
       set((state) => {
@@ -2101,24 +2337,33 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     async reorderPlaylist(playlistId, orderedEntryIds) {
-      const playlist = get().playlists.find((item) => item.id === playlistId);
-      if (!playlist) {
-        return;
-      }
-
-      const lookup = new Map(playlist.entries.map((entry) => [entry.id, entry]));
-      const reordered = reorderPlaylistEntries(
-        orderedEntryIds.map((id) => lookup.get(id)).filter(Boolean) as typeof playlist.entries
-      );
-
-      await persistPlaylist({
-        ...playlist,
-        entries: reordered,
-        updatedAt: new Date().toISOString()
+      await runPlaylistMutation(playlistId, async () => {
+        const playlist = get().playlists.find((item) => item.id === playlistId);
+        if (!playlist) {
+          return;
+        }
+        const lookup = new Map(playlist.entries.map((entry) => [entry.id, entry]));
+        const orderedIds = new Set(orderedEntryIds);
+        if (
+          orderedEntryIds.length !== playlist.entries.length ||
+          orderedIds.size !== playlist.entries.length ||
+          playlist.entries.some((entry) => !orderedIds.has(entry.id))
+        ) {
+          throw new Error("Could not reorder the playlist because its contents changed.");
+        }
+        const reordered = reorderPlaylistEntries(
+          orderedEntryIds.map((id) => lookup.get(id)).filter(Boolean) as typeof playlist.entries
+        );
+        await persistPlaylist({
+          ...playlist,
+          entries: reordered,
+          updatedAt: new Date().toISOString()
+        });
       });
     },
 
     async playTrack(track, queue, source) {
+      const requestId = ++activePlayRequest;
       ensurePlayback();
       const connection = get().connections[track.provider];
       const playbackRequirementMessage = getPlaybackRequirementMessage(track, connection);
@@ -2128,17 +2373,18 @@ export const useAppStore = create<AppState>((set, get) => {
         return;
       }
 
-      // Track where this queue came from (or clear it) so the Now Playing panel can label it.
-      set({ queueSource: source });
-
       const sourceQueue = queue && queue.length > 0 ? queue : [track];
       const startIndex = findQueueTrackIndex(sourceQueue, track);
-      const linkedQueue = await Promise.all(
-        sourceQueue.map((queueTrack) =>
-          queueTrack.projectTrackId
-            ? Promise.resolve(queueTrack)
-            : ensureProjectTrack(queueTrack, "playback")
-        )
+      // A queue is transient context. Persist only the song the user actually chose; importing an
+      // entire album/radio/search queue here inflated storage and polluted Daily Mix seeds with
+      // tracks that had never played.
+      const linkedTrack = await ensureProjectTrack(track, "playback");
+      if (requestId !== activePlayRequest) {
+        return;
+      }
+      const selectedTrackKey = getTrackKey(track);
+      const linkedQueue = sourceQueue.map((queueTrack) =>
+        getTrackKey(queueTrack) === selectedTrackKey ? linkedTrack : queueTrack
       );
       // Shuffle on: play the chosen track first, then everything else from the source in random
       // order. Off: keep the full source queue selected at the chosen song, so playlist and queue
@@ -2152,13 +2398,23 @@ export const useAppStore = create<AppState>((set, get) => {
         : linkedQueue;
       const playIndex = shuffle ? 0 : startIndex;
 
+      if (requestId !== activePlayRequest) {
+        return;
+      }
+      // Track where this queue came from only after this request has won the async linking race.
+      set({ queueSource: source });
       queueEngine.setQueue(playQueue, playIndex);
 
       try {
         // Recently-played + listening stats are recorded centrally in the queue subscription (the
         // first "playing" emit), so auto-advance and manual plays are counted the same way.
-        // Re-arm the de-dupe so deliberately replaying the SAME track still counts as a new play.
-        lastLoggedPlayKey = "";
+        // Re-arm history qualification so deliberately replaying the same queue item is a new
+        // listening session once it reaches the threshold again.
+        statsTrackKey = "";
+        statsQueueIndex = -1;
+        statsListenedMs = 0;
+        statsLastPositionMs = 0;
+        statsPlayLogged = false;
         await queueEngine.playAt(playIndex);
       } catch (error) {
         set({
@@ -2235,23 +2491,31 @@ export const useAppStore = create<AppState>((set, get) => {
         return;
       }
       const library = get().projectTracks.map((item) => item.track);
-      const today = new Date().toISOString().slice(0, 10);
+      const today = localDateKey();
+      const libraryFingerprint = libraryMixFingerprint(library);
       if (
         !force &&
         get().dailyMixesDate === today &&
+        get().dailyMixesLibraryFingerprint === libraryFingerprint &&
         get().dailyMixes.length > 0
       ) {
         return; // Already built for today — stable for the whole day.
       }
       if (library.length < 4) {
-        set({ dailyMixes: [], dailyMixesDate: today, mixesStatus: "ready" });
+        set({
+          dailyMixes: [],
+          dailyMixesDate: today,
+          dailyMixesLibraryFingerprint: libraryFingerprint,
+          mixesStatus: "ready"
+        });
         return;
       }
 
       dailyMixesBuilding = true;
+      let rebuildFromCurrentLibrary = false;
       set({ mixesStatus: "loading" });
       try {
-        const ownedKeys = new Set(library.map(trackKey));
+        const ownedKeys = new Set(library.map(crossProviderKey));
         const clusters = topArtistClusters(library, 6, 2);
 
         // Discover SIMILAR artists for each anchor — not more of the same artist. SoundCloud's
@@ -2266,20 +2530,35 @@ export const useAppStore = create<AppState>((set, get) => {
             let seeds = cluster.tracks.filter((track) => track.provider === "soundcloud").slice(0, 3);
             if (seeds.length === 0) {
               const scHits = (await soundCloudAdapter?.search(cluster.artist).catch(() => [])) ?? [];
-              seeds = scHits.slice(0, 2);
+              const anchorArtist = normalizeArtist(cluster.artist);
+              seeds = scHits
+                .filter((track) => normalizeArtist(primaryArtist(track)) === anchorArtist)
+                .slice(0, 2);
             }
             const relatedPools = await Promise.all(
               seeds.map((seed) => soundCloudAdapter?.relatedTracks(seed).catch(() => []) ?? [])
             );
             const pool = dedupeTracks(relatedPools.flat()).filter(
-              (track) => track.playable && !ownedKeys.has(trackKey(track))
+              (track) => track.playable && !ownedKeys.has(crossProviderKey(track))
             );
             discovered.set(cluster.artist, limitPerArtist(excludeArtist(pool, cluster.artist), 3));
           })
         );
 
+        const currentFingerprint = libraryMixFingerprint(
+          get().projectTracks.map((item) => item.track)
+        );
+        if (currentFingerprint !== libraryFingerprint) {
+          rebuildFromCurrentLibrary = true;
+          return;
+        }
         const mixes = buildDailyMixes(library, { date: today, count: 6, size: 30, discovered });
-        set({ dailyMixes: mixes, dailyMixesDate: today, mixesStatus: "ready" });
+        set({
+          dailyMixes: mixes,
+          dailyMixesDate: today,
+          dailyMixesLibraryFingerprint: libraryFingerprint,
+          mixesStatus: "ready"
+        });
       } catch (error) {
         // An unexpected throw used to leave mixesStatus stuck on "loading" (spinner forever).
         set({
@@ -2288,16 +2567,17 @@ export const useAppStore = create<AppState>((set, get) => {
         });
       } finally {
         dailyMixesBuilding = false;
+        if (rebuildFromCurrentLibrary) {
+          void get().generateDailyMixes(true);
+        }
       }
     },
 
     async startStation(seed) {
       // Station discovery is a multi-hop network fan-out — rapid double clicks used to launch
       // overlapping builds that raced each other for lastStation/playback.
-      if (stationBuilding) {
-        return;
-      }
-      stationBuilding = true;
+      const requestId = ++stationRequestId;
+      const isCurrentRequest = () => requestId === stationRequestId;
       ensurePlayback();
       set({ notice: `Building a station from "${seed.title}"…` });
       try {
@@ -2315,8 +2595,12 @@ export const useAppStore = create<AppState>((set, get) => {
         scSeed = pickBestTwin(seed, titleHits);
         if (!scSeed) {
           const artistHits = (await soundCloudAdapter?.search(primaryArtist(seed)).catch(() => [])) ?? [];
-          scSeed = pickBestTwin(seed, artistHits, 2) ?? titleHits[0] ?? artistHits[0];
+          scSeed = pickBestTwin(seed, artistHits, 2);
         }
+      }
+
+      if (!isCurrentRequest()) {
+        return;
       }
 
       const hop1 = dedupeTracks(
@@ -2328,6 +2612,9 @@ export const useAppStore = create<AppState>((set, get) => {
       const hop2Pools = await Promise.all(
         hop2Seeds.map((track) => soundCloudAdapter?.relatedTracks(track).catch(() => []) ?? [])
       );
+      if (!isCurrentRequest()) {
+        return;
+      }
       const hop1Keys = new Set(hop1.map(trackKey));
       const hop2 = dedupeTracks(hop2Pools.flat()).filter((track) => !hop1Keys.has(trackKey(track)));
 
@@ -2365,6 +2652,9 @@ export const useAppStore = create<AppState>((set, get) => {
               )
             )
           : [];
+      if (!isCurrentRequest()) {
+        return;
+      }
 
       // Build the candidate pool first — the vibe/genre/language signals below need every candidate.
       const rawPool = dedupeTracks([...hop1, ...hop2, ...spotifyPools.flat()]).filter(
@@ -2446,7 +2736,7 @@ export const useAppStore = create<AppState>((set, get) => {
         if (spotifyLaneKeys.has(trackKey(track))) {
           score += 1.75;
         }
-        scoreByCrossKey.set(key, Math.max(scoreByCrossKey.get(key) ?? 0, score));
+        scoreByCrossKey.set(key, Math.max(scoreByCrossKey.get(key) ?? -Infinity, score));
       }
       const candidates = limitPerArtist(dedupeAcrossProviders(rawPool, seed.provider), 3);
       const scores = new Map(
@@ -2454,9 +2744,13 @@ export const useAppStore = create<AppState>((set, get) => {
       );
 
       const station = buildScoredStation(seed, candidates, scores, { size: 50 });
+      if (!isCurrentRequest()) {
+        return;
+      }
       set({ lastStation: station });
       if (station.tracks.length <= 1) {
         set({ notice: `Couldn't find related tracks for "${seed.title}" right now.` });
+        return;
       }
       await get().playTrack(station.tracks[0], station.tracks, {
         kind: "station",
@@ -2465,9 +2759,9 @@ export const useAppStore = create<AppState>((set, get) => {
       });
       set({ notice: `Station started from "${seed.title}".` });
       } catch (error) {
-        set({ notice: getErrorMessage(error, `Couldn't build a station from "${seed.title}".`) });
-      } finally {
-        stationBuilding = false;
+        if (isCurrentRequest()) {
+          set({ notice: getErrorMessage(error, `Couldn't build a station from "${seed.title}".`) });
+        }
       }
     },
 
@@ -2902,10 +3196,14 @@ export const useAppStore = create<AppState>((set, get) => {
 
     async connectSoundCloudViaBrowser() {
       ensurePlayback();
+      const sessionGeneration = ++providerSessionGeneration.soundcloud;
       setSoundCloudConnecting();
       set({ soundCloudLocalStatus: "connecting", soundCloudLocalError: undefined });
 
       const result = await connectSoundCloudViaBrowserBridge();
+      if (sessionGeneration !== providerSessionGeneration.soundcloud) {
+        return;
+      }
       if (!result.ok || !result.data) {
         const message = result.error ?? "SoundCloud sign-in failed.";
         // A cancelled sign-in isn't an error worth a red banner — just return to idle.
@@ -2922,16 +3220,23 @@ export const useAppStore = create<AppState>((set, get) => {
       }
 
       set({ soundCloudLocalStatus: "syncing" });
-      await applySoundCloudProfile(result.data.profile, {
+      const applied = await applySoundCloudProfile(result.data.profile, {
         source: "local-connect",
         connection: result.data.connection,
+        sessionGeneration,
         stats: {
           likesCount: result.data.likesCount,
           playlistsCount: result.data.playlistsCount,
           lastSyncedAt: result.data.lastSyncedAt
         }
       });
+      if (!applied || sessionGeneration !== providerSessionGeneration.soundcloud) {
+        return;
+      }
       const runtime = await reloadDesktopRuntime();
+      if (sessionGeneration !== providerSessionGeneration.soundcloud) {
+        return;
+      }
       set({
         runtime,
         soundCloudLocalStatus: "connected",
@@ -2945,6 +3250,7 @@ export const useAppStore = create<AppState>((set, get) => {
       }
 
       ensurePlayback();
+      const sessionGeneration = ++providerSessionGeneration.soundcloud;
       setSoundCloudConnecting();
       set({
         soundCloudLocalStatus: "connecting",
@@ -2952,6 +3258,9 @@ export const useAppStore = create<AppState>((set, get) => {
       });
 
       const result = await connectSoundCloudLocalProfileBridge(profileId);
+      if (sessionGeneration !== providerSessionGeneration.soundcloud) {
+        return;
+      }
       if (!result.ok || !result.data) {
         const errorData = result.data as unknown as { code?: string } | undefined;
         const message = result.error ?? "SoundCloud Local Connect failed.";
@@ -2967,16 +3276,23 @@ export const useAppStore = create<AppState>((set, get) => {
       }
 
       set({ soundCloudLocalStatus: "syncing" });
-      await applySoundCloudProfile(result.data.profile, {
+      const applied = await applySoundCloudProfile(result.data.profile, {
         source: "local-connect",
         connection: result.data.connection,
+        sessionGeneration,
         stats: {
           likesCount: result.data.likesCount,
           playlistsCount: result.data.playlistsCount,
           lastSyncedAt: result.data.lastSyncedAt
         }
       });
+      if (!applied || sessionGeneration !== providerSessionGeneration.soundcloud) {
+        return;
+      }
       const runtime = await reloadDesktopRuntime();
+      if (sessionGeneration !== providerSessionGeneration.soundcloud) {
+        return;
+      }
       set({
         runtime,
         soundCloudLocalStatus: "connected",

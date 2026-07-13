@@ -1,16 +1,4 @@
-import { appendFileSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { contextBridge, ipcRenderer } from "electron";
-const preloadLogPath = path.join(os.tmpdir(), "studio-relay-preload.log");
-
-function logPreload(message: string) {
-  try {
-    appendFileSync(preloadLogPath, `[${new Date().toISOString()}] ${message}\n`, "utf8");
-  } catch {
-    // Never block renderer bootstrap on preload logging.
-  }
-}
 
 contextBridge.exposeInMainWorld("spotCloud", {
   runtime: {
@@ -27,6 +15,7 @@ contextBridge.exposeInMainWorld("spotCloud", {
       spotifyClientId: string;
       soundCloudClientId: string;
       soundCloudClientSecret: string;
+      soundCloudClientSecretConfigured: boolean;
     }) => ipcRenderer.invoke("spot-cloud:save-desktop-config", config),
     openDirectory: () => ipcRenderer.invoke("spot-cloud:open-config-directory")
   },
@@ -107,15 +96,6 @@ contextBridge.exposeInMainWorld("spotCloud", {
       ipcRenderer.invoke("spot-cloud:cancel-connect-provider", provider)
   },
   drm: {
-    widevineNodeLicense: (request: {
-      psshBase64: string;
-      licenseUrl: string;
-      licenseAuthToken?: string;
-      privateKeyPath: string;
-      identifierBlobPath: string;
-    }) => ipcRenderer.invoke("spot-cloud:widevine-node-license", request),
     getWidevineStatus: () => ipcRenderer.invoke("spot-cloud:get-widevine-status")
   }
 });
-
-logPreload("context bridge exposed");

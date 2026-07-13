@@ -36,7 +36,7 @@ function readCString(buf: Buffer, at: number): string {
   return buf.toString("utf8", at, end);
 }
 
-function parseCookieRecord(buf: Buffer, recordStart: number, out: SafariCookie[], hostContains: string): void {
+function parseCookieRecord(buf: Buffer, recordStart: number, out: SafariCookie[], host: string): void {
   // Need at least the fixed 56-byte header before the strings.
   if (recordStart + 56 > buf.length) {
     return;
@@ -46,7 +46,9 @@ function parseCookieRecord(buf: Buffer, recordStart: number, out: SafariCookie[]
   const valueOff = buf.readUInt32LE(recordStart + 28);
 
   const hostKey = readCString(buf, recordStart + domainOff);
-  if (!hostKey || !hostKey.includes(hostContains)) {
+  const normalizedHost = hostKey.replace(/^\./, "").toLowerCase();
+  const expectedHost = host.replace(/^\./, "").toLowerCase();
+  if (!normalizedHost || (normalizedHost !== expectedHost && !normalizedHost.endsWith(`.${expectedHost}`))) {
     return;
   }
   const name = readCString(buf, recordStart + nameOff);
@@ -54,7 +56,7 @@ function parseCookieRecord(buf: Buffer, recordStart: number, out: SafariCookie[]
   out.push({ name, value, hostKey });
 }
 
-function parsePage(buf: Buffer, pageStart: number, pageSize: number, out: SafariCookie[], hostContains: string): void {
+function parsePage(buf: Buffer, pageStart: number, pageSize: number, out: SafariCookie[], host: string): void {
   const pageEnd = Math.min(pageStart + pageSize, buf.length);
   let p = pageStart + 4; // skip 0x00000100 page header
   if (p + 4 > pageEnd) {
@@ -68,12 +70,12 @@ function parsePage(buf: Buffer, pageStart: number, pageSize: number, out: Safari
     }
     const cookieOffset = buf.readUInt32LE(p);
     p += 4;
-    parseCookieRecord(buf, pageStart + cookieOffset, out, hostContains);
+    parseCookieRecord(buf, pageStart + cookieOffset, out, host);
   }
 }
 
-/** Parses a binarycookies buffer, returning only cookies whose host contains `hostContains`. */
-export function parseBinaryCookies(buf: Buffer, hostContains: string): SafariCookie[] {
+/** Parses a binarycookies buffer, returning only cookies for a host or its subdomains. */
+export function parseBinaryCookies(buf: Buffer, host: string): SafariCookie[] {
   const cookies: SafariCookie[] = [];
   if (buf.length < 8 || buf.toString("latin1", 0, 4) !== MAGIC) {
     return cookies;
@@ -90,7 +92,7 @@ export function parseBinaryCookies(buf: Buffer, hostContains: string): SafariCoo
   }
   let pageStart = offset;
   for (let i = 0; i < pageCount; i += 1) {
-    parsePage(buf, pageStart, pageSizes[i], cookies, hostContains);
+    parsePage(buf, pageStart, pageSizes[i], cookies, host);
     pageStart += pageSizes[i];
   }
   return cookies;

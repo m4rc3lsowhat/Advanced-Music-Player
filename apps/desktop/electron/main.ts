@@ -18,7 +18,7 @@ import {
 } from "electron";
 import { createHash, randomBytes } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, cpSync, existsSync, mkdirSync, promises as fs } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, promises as fs, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -38,7 +38,7 @@ import { DiscordPresenceClient, type DiscordActivity } from "./discordPresence.j
 import { trayIconDataUrl, appIconDataUrl } from "./trayIconData.js";
 import { listFirefoxProfiles, readFirefoxCookies } from "./firefoxCookies.js";
 import { readSafariCookies, FullDiskAccessError } from "./safariCookies.js";
-import { acquireLicenseWithNodeSession } from "./drm/WidevineNodeSession.js";
+import { clearSoundCloudResolverSession } from "./SoundCloudResolverWindow.js";
 
 type Provider = "spotify" | "soundcloud";
 type ProviderStorageMode = "none" | "local-secure" | "memory-only";
@@ -109,6 +109,7 @@ interface DesktopConfig {
   spotifyClientId: string;
   soundCloudClientId: string;
   soundCloudClientSecret: string;
+  soundCloudClientSecretConfigured: boolean;
 }
 
 interface ProviderRuntimeOAuthStatus {
@@ -218,7 +219,7 @@ const isDev = !!process.env.VITE_DEV_SERVER_URL;
 protocol.registerSchemesAsPrivileged([
   {
     scheme: "amp-local",
-    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true }
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
   }
 ]);
 
@@ -257,7 +258,7 @@ interface DiscordPresencePayload {
   title: string;
   artists: string;
   album?: string;
-  provider: Provider;
+  provider: "spotify" | "soundcloud" | "youtube" | "local";
   status: "playing" | "paused";
   /** Epoch ms the current track started (renderer computes Date.now() - positionMs). */
   startedAtMs?: number;
@@ -269,9 +270,14 @@ function discordActivityFromPayload(payload: DiscordPresencePayload | null): Dis
   if (!payload || !payload.title) {
     return null;
   }
-  const providerLabel = payload.provider === "spotify" ? "Spotify" : "SoundCloud";
+  const providerLabel = {
+    spotify: "Spotify",
+    soundcloud: "SoundCloud",
+    youtube: "YouTube",
+    local: "Local file"
+  }[payload.provider];
   const buttons =
-    payload.externalUrl && /^https?:\/\//i.test(payload.externalUrl)
+    payload.externalUrl && isAllowedDiscordTrackUrl(payload.provider, payload.externalUrl)
       ? [{ label: `Listen on ${providerLabel}`, url: payload.externalUrl }]
       : undefined;
   // The album cover as the big art (current Discord proxies https image URLs in RPC). An explicit
@@ -279,7 +285,7 @@ function discordActivityFromPayload(payload: DiscordPresencePayload | null): Dis
   // it's Spotify or SoundCloud (and doubles as the play/pause indicator on hover).
   const largeImage =
     process.env.DISCORD_LARGE_IMAGE?.trim() ||
-    (payload.artworkUrl && /^https:\/\//i.test(payload.artworkUrl) ? payload.artworkUrl : undefined);
+    (payload.artworkUrl && isAllowedArtworkUrl(payload.artworkUrl) ? payload.artworkUrl : undefined);
   return {
     details: payload.title,
     state: payload.artists ? `by ${payload.artists}` : providerLabel,
@@ -452,6 +458,81 @@ if (!singleInstanceLock) {
   app.quit();
 }
 
+const STARTUP_LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+function redactLogText(value: string): string {
+  return value
+    .replace(/([?&](?:license_token|oauth_token|access_token|refresh_token|client_secret)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/\b(?:oauth|access|refresh|license)\s*token\s*[:=]\s*[^\s,}]+/gi, "token=[redacted]");
+}
+
+function readDiscordText(value: unknown, maxLength: number, required = false): string | undefined {
+  if (typeof value !== "string") {
+    if (required) {
+      throw new Error("Discord presence payload is malformed.");
+    }
+    return undefined;
+  }
+  const text = value.trim().slice(0, maxLength);
+  if (required && !text) {
+    throw new Error("Discord presence payload is malformed.");
+  }
+  return text || undefined;
+}
+
+function parseDiscordPresencePayload(value: unknown): DiscordPresencePayload | null {
+  if (value === null) {
+    return null;
+  }
+  if (!value || typeof value !== "object") {
+    throw new Error("Discord presence payload is malformed.");
+  }
+  const input = value as Record<string, unknown>;
+  const provider = input.provider;
+  const status = input.status;
+  if (
+    !["spotify", "soundcloud", "youtube", "local"].includes(String(provider)) ||
+    (status !== "playing" && status !== "paused")
+  ) {
+    throw new Error("Discord presence payload is malformed.");
+  }
+  return {
+    title: readDiscordText(input.title, 128, true)!,
+    artists: readDiscordText(input.artists, 128) ?? "",
+    album: readDiscordText(input.album, 128),
+    provider: provider as DiscordPresencePayload["provider"],
+    status,
+    startedAtMs:
+      typeof input.startedAtMs === "number" && Number.isFinite(input.startedAtMs)
+        ? Math.max(0, input.startedAtMs)
+        : undefined,
+    artworkUrl: readDiscordText(input.artworkUrl, 2_048),
+    externalUrl: readDiscordText(input.externalUrl, 2_048)
+  };
+}
+
+function isAllowedDiscordTrackUrl(provider: DiscordPresencePayload["provider"], rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "https:") {
+      return false;
+    }
+    const host = url.hostname.toLowerCase();
+    switch (provider) {
+      case "spotify":
+        return host === "open.spotify.com";
+      case "soundcloud":
+        return host === "soundcloud.com" || host.endsWith(".soundcloud.com");
+      case "youtube":
+        return host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtu.be";
+      case "local":
+        return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
 function logStartup(message: string, error?: unknown) {
   const details =
     error instanceof Error
@@ -461,9 +542,12 @@ function logStartup(message: string, error?: unknown) {
         : "";
 
   try {
+    if ((statSync(startupLogPath, { throwIfNoEntry: false })?.size ?? 0) > STARTUP_LOG_MAX_BYTES) {
+      writeFileSync(startupLogPath, "", "utf8");
+    }
     appendFileSync(
       startupLogPath,
-      `[${new Date().toISOString()}] ${message}${details ? `\n${details}` : ""}\n`,
+      `[${new Date().toISOString()}] ${redactLogText(message)}${details ? `\n${redactLogText(details)}` : ""}\n`,
       "utf8"
     );
   } catch {
@@ -477,6 +561,41 @@ function isAllowedExternalUrl(rawUrl: string): boolean {
     return parsed.protocol === "https:" || parsed.protocol === "http:";
   } catch {
     return false;
+  }
+}
+
+function isTrustedMainWindowUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+    if (devServerUrl) {
+      return parsed.origin === new URL(devServerUrl).origin;
+    }
+    if (parsed.protocol !== "file:") {
+      return false;
+    }
+    const rendererPath = path.resolve(moduleDirectory, "../dist/index.html");
+    return path.resolve(fileURLToPath(parsed)) === rendererPath;
+  } catch {
+    return false;
+  }
+}
+
+const SOUNDCLOUD_PLAYBACK_HOSTS = new Set([
+  "playback.media-streaming.soundcloud.cloud",
+  "license.media-streaming.soundcloud.cloud",
+  "api-widget.soundcloud.com"
+]);
+
+function getTrustedSoundCloudPlaybackHost(rawUrl: string): string | undefined {
+  try {
+    const url = new URL(rawUrl);
+    const hostname = url.hostname.toLowerCase();
+    return url.protocol === "https:" && SOUNDCLOUD_PLAYBACK_HOSTS.has(hostname)
+      ? hostname
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -693,6 +812,10 @@ function getDesktopEnvPath(): string {
   return path.join(app.getPath("userData"), ".env");
 }
 
+function getDesktopSecretPath(): string {
+  return path.join(app.getPath("userData"), "desktop-secret.bin");
+}
+
 function getProviderSessionsPath(): string {
   return path.join(app.getPath("userData"), "provider-sessions.json");
 }
@@ -705,8 +828,70 @@ function createEmptyDesktopConfig(): DesktopConfig {
   return {
     spotifyClientId: "",
     soundCloudClientId: "",
-    soundCloudClientSecret: ""
+    soundCloudClientSecret: "",
+    soundCloudClientSecretConfigured: false
   };
+}
+
+function parseDesktopConfig(value: unknown): DesktopConfig {
+  if (!value || typeof value !== "object") {
+    throw new Error("Desktop configuration is malformed.");
+  }
+  const input = value as Record<string, unknown>;
+  const readValue = (key: string) => {
+    const candidate = input[key];
+    if (typeof candidate !== "string" || candidate.length > 4_096) {
+      throw new Error("Desktop configuration is malformed.");
+    }
+    return candidate;
+  };
+  return {
+    spotifyClientId: readValue("spotifyClientId"),
+    soundCloudClientId: readValue("soundCloudClientId"),
+    soundCloudClientSecret: readValue("soundCloudClientSecret"),
+    soundCloudClientSecretConfigured: input.soundCloudClientSecretConfigured === true
+  };
+}
+
+async function writeEncryptedDesktopSecret(secret: string): Promise<void> {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("Secure credential storage is unavailable on this device.");
+  }
+  const tempPath = `${getDesktopSecretPath()}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(tempPath, safeStorage.encryptString(secret));
+    await fs.rename(tempPath, getDesktopSecretPath());
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function readEncryptedDesktopSecret(): Promise<string> {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) {
+      return "";
+    }
+    return safeStorage.decryptString(await fs.readFile(getDesktopSecretPath())).trim();
+  } catch {
+    return "";
+  }
+}
+
+async function writePublicDesktopConfig(config: Pick<DesktopConfig, "spotifyClientId" | "soundCloudClientId">) {
+  const contents = serializeEnvFile({
+    SPOTIFY_CLIENT_ID: config.spotifyClientId,
+    SOUNDCLOUD_CLIENT_ID: config.soundCloudClientId,
+    SOUNDCLOUD_CLIENT_SECRET: ""
+  });
+  const tempPath = `${getDesktopEnvPath()}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(tempPath, contents, "utf8");
+    await fs.rename(tempPath, getDesktopEnvPath());
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function readDesktopConfig(): Promise<DesktopConfig> {
@@ -716,9 +901,19 @@ async function readDesktopConfig(): Promise<DesktopConfig> {
     const parsed = parseEnvFile(await fs.readFile(getDesktopEnvPath(), "utf8"));
     config.spotifyClientId = parsed.SPOTIFY_CLIENT_ID ?? "";
     config.soundCloudClientId = parsed.SOUNDCLOUD_CLIENT_ID ?? "";
-    config.soundCloudClientSecret = parsed.SOUNDCLOUD_CLIENT_SECRET ?? "";
+    const encryptedSecret = await readEncryptedDesktopSecret();
+    const legacySecret = parsed.SOUNDCLOUD_CLIENT_SECRET?.trim() ?? "";
+    if (!encryptedSecret && legacySecret && safeStorage.isEncryptionAvailable()) {
+      await writeEncryptedDesktopSecret(legacySecret);
+      await writePublicDesktopConfig(config);
+    }
+    config.soundCloudClientSecretConfigured = Boolean(encryptedSecret || legacySecret);
   } catch {
     // Optional file.
+  }
+
+  if (!config.soundCloudClientSecretConfigured) {
+    config.soundCloudClientSecretConfigured = Boolean(await readEncryptedDesktopSecret());
   }
 
   return config;
@@ -726,10 +921,12 @@ async function readDesktopConfig(): Promise<DesktopConfig> {
 
 async function readResolvedDesktopConfig(): Promise<DesktopConfig> {
   const config = await readDesktopConfig();
+  const storedSecret = await readEncryptedDesktopSecret();
   return {
     spotifyClientId: config.spotifyClientId || process.env.SPOTIFY_CLIENT_ID || "",
     soundCloudClientId: config.soundCloudClientId || process.env.SOUNDCLOUD_CLIENT_ID || "",
-    soundCloudClientSecret: config.soundCloudClientSecret || process.env.SOUNDCLOUD_CLIENT_SECRET || ""
+    soundCloudClientSecret: storedSecret || process.env.SOUNDCLOUD_CLIENT_SECRET || "",
+    soundCloudClientSecretConfigured: Boolean(storedSecret || process.env.SOUNDCLOUD_CLIENT_SECRET)
   };
 }
 
@@ -739,16 +936,19 @@ async function writeDesktopConfig(config: DesktopConfig): Promise<DesktopConfig>
   const normalized: DesktopConfig = {
     spotifyClientId: config.spotifyClientId.trim(),
     soundCloudClientId: config.soundCloudClientId.trim(),
-    soundCloudClientSecret: config.soundCloudClientSecret.trim()
+    soundCloudClientSecret: "",
+    soundCloudClientSecretConfigured: config.soundCloudClientSecretConfigured
   };
-
-  const contents = serializeEnvFile({
-    SPOTIFY_CLIENT_ID: normalized.spotifyClientId,
-    SOUNDCLOUD_CLIENT_ID: normalized.soundCloudClientId,
-    SOUNDCLOUD_CLIENT_SECRET: normalized.soundCloudClientSecret
-  });
-
-  await fs.writeFile(getDesktopEnvPath(), contents, "utf8");
+  const incomingSecret = config.soundCloudClientSecret.trim();
+  if (incomingSecret) {
+    await writeEncryptedDesktopSecret(incomingSecret);
+  } else if (!config.soundCloudClientSecretConfigured) {
+    await fs.rm(getDesktopSecretPath(), { force: true });
+  }
+  normalized.soundCloudClientSecretConfigured = Boolean(
+    incomingSecret || (await readEncryptedDesktopSecret()) || process.env.SOUNDCLOUD_CLIENT_SECRET
+  );
+  await writePublicDesktopConfig(normalized);
   await reloadManagedDesktopEnv();
   return normalized;
 }
@@ -771,8 +971,9 @@ async function reloadManagedDesktopEnv() {
   if (config.soundCloudClientId) {
     process.env.SOUNDCLOUD_CLIENT_ID = config.soundCloudClientId;
   }
-  if (config.soundCloudClientSecret) {
-    process.env.SOUNDCLOUD_CLIENT_SECRET = config.soundCloudClientSecret;
+  const storedSecret = await readEncryptedDesktopSecret();
+  if (storedSecret) {
+    process.env.SOUNDCLOUD_CLIENT_SECRET = storedSecret;
   }
 }
 
@@ -856,7 +1057,6 @@ async function waitForLoopbackAuthorizationCode(
     }
 
     settled = true;
-    pendingAuthCancellers.delete(provider);
     resolveCallback(value);
   };
 
@@ -889,7 +1089,6 @@ async function waitForLoopbackAuthorizationCode(
       </html>
     `);
 
-    void closeServer();
     resolveOnce(result);
   });
 
@@ -900,18 +1099,12 @@ async function waitForLoopbackAuthorizationCode(
 
   const address = server.address() as AddressInfo;
   const redirectUri = `http://127.0.0.1:${address.port}/${provider}/callback`;
-  const authUrl = await authUrlFactory(redirectUri);
-  // Open the provider sign-in in the user's DEFAULT BROWSER. The loopback server above
-  // catches the redirect back to 127.0.0.1, so no in-app auth window is needed.
-  await openAllowedExternalUrl(authUrl);
+  const cancel = () => resolveOnce({ error: AUTH_CANCELLED_MESSAGE, redirectUri });
+  pendingAuthCancellers.get(provider)?.();
+  pendingAuthCancellers.set(provider, cancel);
 
-  // Let the renderer cancel this wait (e.g. the user closed the browser tab without finishing).
-  pendingAuthCancellers.set(provider, () =>
-    resolveOnce({ error: AUTH_CANCELLED_MESSAGE, redirectUri })
-  );
-
-  // Backstop timeout. Short enough that an abandoned sign-in (where the user didn't hit Cancel)
-  // clears on its own without a long hang, long enough to complete a real sign-in incl. 2FA.
+  // Install cleanup and the timeout before doing anything else that can reject. This prevents a
+  // failed auth URL build or browser launch from leaving a listening server behind.
   const timeout = setTimeout(() => {
     resolveOnce({
       error: "Sign-in timed out before authorization completed (no response from the browser).",
@@ -919,10 +1112,19 @@ async function waitForLoopbackAuthorizationCode(
     });
   }, 90000);
 
-  const result = await callbackPromise;
-  clearTimeout(timeout);
-  await closeServer();
-  return result;
+  try {
+    const authUrl = await authUrlFactory(redirectUri);
+    // Open the provider sign-in in the user's DEFAULT BROWSER. The loopback server above
+    // catches the redirect back to 127.0.0.1, so no in-app auth window is needed.
+    await openAllowedExternalUrl(authUrl);
+    return await callbackPromise;
+  } finally {
+    clearTimeout(timeout);
+    if (pendingAuthCancellers.get(provider) === cancel) {
+      pendingAuthCancellers.delete(provider);
+    }
+    await closeServer();
+  }
 }
 
 function handleProtocolCallback(rawUrl: string): boolean {
@@ -996,10 +1198,17 @@ async function waitForCustomProtocolAuthorizationCode(
     if (timeout) {
       clearTimeout(timeout);
     }
-    pendingProtocolResolvers.delete(provider);
-    pendingAuthCancellers.delete(provider);
+    if (pendingProtocolResolvers.get(provider) === resolver) {
+      pendingProtocolResolvers.delete(provider);
+    }
+    if (pendingAuthCancellers.get(provider) === cancel) {
+      pendingAuthCancellers.delete(provider);
+    }
     resolveCallback(value);
   };
+
+  const resolver = { resolve: resolveOnce };
+  const cancel = () => resolveOnce({ error: AUTH_CANCELLED_MESSAGE, redirectUri });
 
   timeout = setTimeout(() => {
     resolveOnce({
@@ -1008,23 +1217,17 @@ async function waitForCustomProtocolAuthorizationCode(
     });
   }, 90000);
 
-  pendingProtocolResolvers.set(provider, {
-    resolve: resolveOnce
-  });
+  pendingAuthCancellers.get(provider)?.();
+  pendingProtocolResolvers.set(provider, resolver);
   // Let the renderer cancel this wait (e.g. the user closed the browser tab without finishing).
-  pendingAuthCancellers.set(provider, () =>
-    resolveOnce({ error: AUTH_CANCELLED_MESSAGE, redirectUri })
-  );
+  pendingAuthCancellers.set(provider, cancel);
 
   try {
     // Open the provider sign-in in the user's DEFAULT BROWSER. The musync:// redirect
     // is delivered back to the app by the OS protocol handler (open-url / second-instance).
     await openAllowedExternalUrl(authUrl);
   } catch (error) {
-    pendingProtocolResolvers.delete(provider);
-    if (timeout) {
-      clearTimeout(timeout);
-    }
+    resolveOnce({ error: AUTH_CANCELLED_MESSAGE, redirectUri });
     throw error;
   }
 
@@ -1351,23 +1554,12 @@ function getSoundCloudOAuthTokenFromCookies(
   cookies: Array<{ name: string; value: string; domain: string }>
 ): string | undefined {
   const raw = cookies
-    .filter((cookie) => cookie.name === "oauth_token" && /soundcloud\.com$/i.test(cookie.domain))
+    .filter(
+      (cookie) => cookie.name === "oauth_token" && /(^|\.)soundcloud\.com$/i.test(cookie.domain)
+    )
     .map((cookie) => cookie.value)
     .find((value) => value && value.length > 8);
   return raw ? decodeURIComponent(raw) : undefined;
-}
-
-/**
- * The browser's `datadome` anti-bot cookie for soundcloud.com. Reads work without it, but
- * authenticated WRITES (liking a track) are 403'd by DataDome unless this cookie rides along.
- */
-function getSoundCloudDataDomeCookie(
-  cookies: Array<{ name: string; value: string; domain: string }>
-): string | undefined {
-  return cookies
-    .filter((cookie) => cookie.name === "datadome" && /soundcloud\.com$/i.test(cookie.domain))
-    .map((cookie) => cookie.value)
-    .find((value) => Boolean(value));
 }
 
 function getLocalConnectMessage(code: SoundCloudLocalConnectErrorCode): string {
@@ -1744,8 +1936,6 @@ async function connectSoundCloudBrowserProfile(
 
   const profile = profileResult.data as SoundCloudLocalConnectResult["profile"];
   const lastSyncedAt = new Date().toISOString();
-  // Persist the datadome anti-bot cookie so authenticated writes (likes) survive across restarts.
-  const dataDomeCookie = getSoundCloudDataDomeCookie(capturedCookies);
   const payload: ProviderConnectionPayload = {
     provider: "soundcloud",
     accessToken: token,
@@ -1758,8 +1948,7 @@ async function connectSoundCloudBrowserProfile(
       profileName: selectedProfile.profileName,
       likesCount: String(profile.likes.length),
       playlistsCount: String(profile.playlists.length),
-      lastSyncedAt,
-      ...(dataDomeCookie ? { dataDomeCookie } : {})
+      lastSyncedAt
     }
   };
   const persisted = await persistLocalProviderSession(payload);
@@ -1796,7 +1985,7 @@ async function readSoundCloudPartitionToken(): Promise<string | undefined> {
     const ses = session.fromPartition(SOUNDCLOUD_LOCAL_PARTITION);
     const cookies = await ses.cookies.get({ name: "oauth_token" });
     const raw = cookies
-      .filter((cookie) => /soundcloud\.com$/i.test(cookie.domain ?? ""))
+      .filter((cookie) => /(^|\.)soundcloud\.com$/i.test(cookie.domain ?? ""))
       .map((cookie) => cookie.value)
       .find((value) => value && value.length > 8);
     return raw ? decodeURIComponent(raw) : undefined;
@@ -1895,9 +2084,6 @@ async function signInSoundCloudViaSystemBrowser(): Promise<GatewayResponse<Sound
   );
   const profile = profileResult.data as SoundCloudLocalConnectResult["profile"];
   const lastSyncedAt = new Date().toISOString();
-  const dataDomeCookie = getSoundCloudDataDomeCookie(
-    result.cookies.map((cookie) => ({ name: cookie.name, value: cookie.value, domain: cookie.domain }))
-  );
   const payload: ProviderConnectionPayload = {
     provider: "soundcloud",
     accessToken: token,
@@ -1908,8 +2094,7 @@ async function signInSoundCloudViaSystemBrowser(): Promise<GatewayResponse<Sound
       browserName: browser.browserName,
       likesCount: String(profile.likes.length),
       playlistsCount: String(profile.playlists.length),
-      lastSyncedAt,
-      ...(dataDomeCookie ? { dataDomeCookie } : {})
+      lastSyncedAt
     }
   };
   const persisted = await persistLocalProviderSession(payload);
@@ -1958,6 +2143,15 @@ async function signInSoundCloudInApp(): Promise<GatewayResponse<SoundCloudLocalC
     }
   });
   soundCloudSignInWindow = win;
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  const guardSoundCloudSignInNavigation = (event: { preventDefault(): void }, url: string) => {
+    if (!isTrustedSoundCloudPage(url)) {
+      event.preventDefault();
+      logStartup("soundcloud:signin:blocked-navigation");
+    }
+  };
+  win.webContents.on("will-navigate", guardSoundCloudSignInNavigation);
+  win.webContents.on("will-redirect", guardSoundCloudSignInNavigation);
 
   return new Promise<GatewayResponse<SoundCloudLocalConnectResult>>((resolve) => {
     let settled = false;
@@ -2086,7 +2280,7 @@ function sanitizeDownloadName(name: string): string {
 }
 
 async function uniqueDownloadPath(dir: string, fileName: string): Promise<string> {
-  const ext = path.extname(fileName) || ".mp3";
+  const ext = path.extname(fileName) || ".audio";
   const stem = path.basename(fileName, ext);
   let candidate = path.join(dir, `${stem}${ext}`);
   for (let i = 2; i <= 999; i += 1) {
@@ -2100,13 +2294,43 @@ async function uniqueDownloadPath(dir: string, fileName: string): Promise<string
   return candidate;
 }
 
+const DOWNLOAD_MAX_BYTES = 250 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT_MS = 60_000;
+const HLS_PLAYLIST_MAX_BYTES = 1024 * 1024;
+
+function detectAudioExtension(data: Buffer): string | undefined {
+  if (data.subarray(0, 3).toString("ascii") === "ID3" || (data[0] === 0xff && (data[1] & 0xe0) === 0xe0)) {
+    // ADTS AAC uses the 0xFFF sync word too. Layer bits are zero for ADTS and non-zero for MP3.
+    return (data[1] & 0x06) === 0 ? ".aac" : ".mp3";
+  }
+  if (data.length >= 12 && data.subarray(4, 8).toString("ascii") === "ftyp") {
+    return ".m4a";
+  }
+  if (data[0] === 0x47 && (data.length < 189 || data[188] === 0x47)) {
+    return ".ts";
+  }
+  if (data.subarray(0, 4).toString("ascii") === "OggS") {
+    return ".ogg";
+  }
+  if (data.subarray(0, 4).toString("ascii") === "fLaC") {
+    return ".flac";
+  }
+  if (
+    data.subarray(0, 4).toString("ascii") === "RIFF" &&
+    data.subarray(8, 12).toString("ascii") === "WAVE"
+  ) {
+    return ".wav";
+  }
+  return undefined;
+}
+
 /** Fetch + concatenate a non-DRM HLS media playlist's segments. Descends one level for a master. */
 async function fetchHlsAudio(playlistUrl: string, depth = 0): Promise<Buffer> {
-  const response = await fetch(playlistUrl);
+  const response = await fetch(playlistUrl, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
   if (!response.ok) {
     throw new Error(`Stream playlist failed (HTTP ${response.status}).`);
   }
-  const text = await response.text();
+  const text = (await readLimitedResponse(response, HLS_PLAYLIST_MAX_BYTES)).toString("utf8");
   const urls = text
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -2120,11 +2344,19 @@ async function fetchHlsAudio(playlistUrl: string, depth = 0): Promise<Buffer> {
     return fetchHlsAudio(urls[0], depth + 1);
   }
   const chunks: Buffer[] = [];
+  let totalBytes = 0;
   for (const url of urls) {
-    const segment = await fetch(url);
-    if (segment.ok) {
-      chunks.push(Buffer.from(await segment.arrayBuffer()));
+    const segment = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+    if (!segment.ok) {
+      throw new Error(`Stream segment failed (HTTP ${segment.status}).`);
     }
+    const remaining = DOWNLOAD_MAX_BYTES - totalBytes;
+    if (remaining <= 0) {
+      throw new Error("Download exceeded the 250 MB safety limit.");
+    }
+    const chunk = await readLimitedResponse(segment, remaining);
+    totalBytes += chunk.length;
+    chunks.push(chunk);
   }
   if (chunks.length === 0) {
     throw new Error("No audio segments could be downloaded.");
@@ -2161,22 +2393,99 @@ async function downloadSoundCloudTrack(
   const dir = path.join(app.getPath("music"), "AMP");
   await fs.mkdir(dir, { recursive: true });
   const artist = track.creators?.find((name) => name && name.trim()) ?? "Unknown Artist";
-  const outPath = await uniqueDownloadPath(dir, `${sanitizeDownloadName(`${artist} - ${track.title}`)}.mp3`);
+  const baseName = sanitizeDownloadName(`${artist} - ${track.title}`);
+  let tempPath: string | undefined;
 
   try {
-    const response = await fetch(stream.url);
+    const response = await fetch(stream.url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
     if (!response.ok) {
       return { ok: false, error: `Download failed (HTTP ${response.status}).` };
     }
-    const body = Buffer.from(await response.arrayBuffer());
+    const body = await readLimitedResponse(response, DOWNLOAD_MAX_BYTES);
     const isPlaylist = body.subarray(0, 7).toString("utf8") === "#EXTM3U";
     const audio = isPlaylist ? await fetchHlsAudio(stream.url) : body;
-    await fs.writeFile(outPath, audio);
+    const extension = detectAudioExtension(audio);
+    if (!extension) {
+      return { ok: false, error: "The stream used an unsupported audio container." };
+    }
+    const outPath = await uniqueDownloadPath(dir, `${baseName}${extension}`);
+    tempPath = `${outPath}.${randomBytes(8).toString("hex")}.part`;
+    await fs.writeFile(tempPath, audio);
+    await fs.rename(tempPath, outPath);
     return { ok: true, path: outPath };
   } catch (error) {
-    await fs.rm(outPath, { force: true }).catch(() => undefined); // never leave a partial file
+    if (tempPath) {
+      await fs.rm(tempPath, { force: true }).catch(() => undefined); // never leave a partial file
+    }
     return { ok: false, error: error instanceof Error ? error.message : "Download failed." };
   }
+}
+
+async function clearDefaultSoundCloudOAuthCookies(): Promise<void> {
+  const cookies = await session.defaultSession.cookies.get({ name: "oauth_token" }).catch(() => []);
+  await Promise.all(
+    cookies
+      .filter((cookie) => /(^|\.)soundcloud\.com$/i.test(cookie.domain ?? ""))
+      .map((cookie) => {
+        const hostname = (cookie.domain ?? "soundcloud.com").replace(/^\./, "");
+        return session.defaultSession.cookies
+          .remove(`https://${hostname}${cookie.path || "/"}`, "oauth_token")
+          .catch(() => undefined);
+      })
+  );
+}
+
+const ARTWORK_MAX_BYTES = 8 * 1024 * 1024;
+const ARTWORK_TIMEOUT_MS = 10_000;
+const ARTWORK_HOST_SUFFIXES = [
+  "scdn.co",
+  "spotifycdn.com",
+  "sndcdn.com",
+  "ytimg.com",
+  "ggpht.com",
+  "dzcdn.net"
+];
+
+function isAllowedArtworkUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    const hostname = url.hostname.toLowerCase();
+    return (
+      url.protocol === "https:" &&
+      ARTWORK_HOST_SUFFIXES.some(
+        (suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`)
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function readLimitedResponse(response: Response, maxBytes: number): Promise<Buffer> {
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new Error("Response was too large.");
+  }
+  if (!response.body) {
+    return Buffer.alloc(0);
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new Error("Response was too large.");
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks, total);
 }
 
 async function resolveArtworkAsset(request: ArtworkRequest): Promise<ResolvedArtwork> {
@@ -2185,10 +2494,15 @@ async function resolveArtworkAsset(request: ArtworkRequest): Promise<ResolvedArt
   }
 
   if (!/^https?:\/\//i.test(request.artworkUrl)) {
-    return {
-      dataUrl: request.artworkUrl,
-      source: "passthrough"
-    };
+    return /^(data:|blob:|amp-local:)/i.test(request.artworkUrl)
+      ? { dataUrl: request.artworkUrl, source: "passthrough" }
+      : { source: "none" };
+  }
+
+  // Provider metadata is untrusted. Unknown hosts fail closed instead of becoming a direct image
+  // request that bypasses the main-process type, size, redirect, and timeout checks.
+  if (!isAllowedArtworkUrl(request.artworkUrl)) {
+    return { source: "none" };
   }
 
   const cacheKey = createHash("sha1")
@@ -2217,15 +2531,29 @@ async function resolveArtworkAsset(request: ArtworkRequest): Promise<ResolvedArt
     }
 
     try {
-      const response = await fetch(request.artworkUrl!);
+      const response = await fetch(request.artworkUrl!, {
+        signal: AbortSignal.timeout(ARTWORK_TIMEOUT_MS)
+      });
       if (!response.ok) {
         return { source: "none" as const };
       }
 
-      const contentType = response.headers.get("content-type") ?? "image/jpeg";
-      const buffer = Buffer.from(await response.arrayBuffer());
+      if (!isAllowedArtworkUrl(response.url)) {
+        return { source: "none" as const };
+      }
+
+      const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim() ?? "";
+      if (!contentType.startsWith("image/")) {
+        return { source: "none" as const };
+      }
+      const buffer = await readLimitedResponse(response, ARTWORK_MAX_BYTES);
       const dataUrl = `data:${contentType};base64,${buffer.toString("base64")}`;
-      await fs.writeFile(cachePath, dataUrl, "utf8");
+      const tempPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+      await fs.writeFile(tempPath, dataUrl, "utf8");
+      await fs.rename(tempPath, cachePath).catch(async (error) => {
+        await fs.rm(tempPath, { force: true }).catch(() => undefined);
+        throw error;
+      });
       return {
         dataUrl,
         source: "download" as const
@@ -2249,15 +2577,42 @@ async function readProviderSessionsFile(): Promise<Record<Provider, StoredProvid
   try {
     const file = await fs.readFile(getProviderSessionsPath(), "utf8");
     const parsed = JSON.parse(file) as Record<Provider, StoredProviderSessionRecord | undefined>;
-    return {
-      spotify: parsed.spotify,
-      soundcloud: parsed.soundcloud
+    let scrubbedLegacyMetadata = false;
+    const scrub = (record: StoredProviderSessionRecord | undefined) => {
+      if (!record?.metadata || !("dataDomeCookie" in record.metadata)) {
+        return record;
+      }
+      const { dataDomeCookie: _discarded, ...metadata } = record.metadata;
+      scrubbedLegacyMetadata = true;
+      return { ...record, metadata };
     };
-  } catch {
-    return {
-      spotify: undefined,
-      soundcloud: undefined
+    const sessions = {
+      spotify: scrub(parsed?.spotify),
+      soundcloud: scrub(parsed?.soundcloud)
     };
+    if (scrubbedLegacyMetadata) {
+      await writeProviderSessionsFile(sessions);
+    }
+    return sessions;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return {
+        spotify: undefined,
+        soundcloud: undefined
+      };
+    }
+    if (error instanceof SyntaxError) {
+      const sourcePath = getProviderSessionsPath();
+      const backupPath = `${sourcePath}.corrupt-${Date.now()}`;
+      await fs.rename(sourcePath, backupPath).catch(() => undefined);
+      logStartup("auth:quarantined-corrupt-session-file");
+      return {
+        spotify: undefined,
+        soundcloud: undefined
+      };
+    }
+    throw error;
   }
 }
 
@@ -2265,24 +2620,68 @@ async function writeProviderSessionsFile(
   sessions: Record<Provider, StoredProviderSessionRecord | undefined>
 ): Promise<void> {
   await fs.mkdir(app.getPath("userData"), { recursive: true });
-  await fs.writeFile(getProviderSessionsPath(), JSON.stringify(sessions, null, 2), "utf8");
+  const targetPath = getProviderSessionsPath();
+  const temporaryPath = `${targetPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await fs.writeFile(temporaryPath, JSON.stringify(sessions, null, 2), "utf8");
+    await fs.rename(temporaryPath, targetPath);
+  } finally {
+    await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
 }
+
+let providerSessionMutationQueue: Promise<void> = Promise.resolve();
+
+function mutateProviderSessions<T>(
+  mutation: (sessions: Record<Provider, StoredProviderSessionRecord | undefined>) => T | Promise<T>
+): Promise<T> {
+  const run = providerSessionMutationQueue.then(async () => {
+    const sessions = await readProviderSessionsFile();
+    const result = await mutation(sessions);
+    await writeProviderSessionsFile(sessions);
+    return result;
+  });
+  providerSessionMutationQueue = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+const providerSessionEpoch = new Map<Provider, number>([
+  ["spotify", 0],
+  ["soundcloud", 0]
+]);
+
+function getProviderSessionEpoch(provider: Provider): number {
+  return providerSessionEpoch.get(provider) ?? 0;
+}
+
+class StaleProviderSessionError extends Error {}
 
 async function persistLocalProviderSession(
   payload: ProviderConnectionPayload,
-  connectedAt = new Date().toISOString()
+  connectedAt = new Date().toISOString(),
+  expectedEpoch?: number
 ): Promise<{ storageMode: ProviderStorageMode; sessionSource: ProviderSessionSource; connectedAt: string }> {
+  const assertCurrentSession = () => {
+    if (expectedEpoch !== undefined && getProviderSessionEpoch(payload.provider) !== expectedEpoch) {
+      throw new StaleProviderSessionError("Provider session changed while credentials were refreshing.");
+    }
+  };
+  assertCurrentSession();
   const volatileSession: VolatileProviderSession = {
     ...payload,
     connectedAt,
     storageMode: isSecureStorageAvailable() ? "local-secure" : "memory-only"
   };
-  volatileProviderSessions.set(payload.provider, volatileSession);
-
   if (!isSecureStorageAvailable()) {
-    const existing = await readProviderSessionsFile();
-    existing[payload.provider] = undefined;
-    await writeProviderSessionsFile(existing);
+    await mutateProviderSessions((sessions) => {
+      assertCurrentSession();
+      sessions[payload.provider] = undefined;
+    });
+    assertCurrentSession();
+    volatileProviderSessions.set(payload.provider, volatileSession);
     return {
       storageMode: "memory-only",
       sessionSource: "memory",
@@ -2290,19 +2689,22 @@ async function persistLocalProviderSession(
     };
   }
 
-  const sessions = await readProviderSessionsFile();
-  sessions[payload.provider] = {
-    provider: payload.provider,
-    encryptedAccessToken: encryptToken(payload.accessToken),
-    encryptedRefreshToken: encryptToken(payload.refreshToken),
-    expiresAt: payload.expiresAt,
-    displayName: payload.displayName,
-    requiresPremium: payload.requiresPremium,
-    metadata: payload.metadata,
-    connectedAt,
-    storageMode: "local-secure"
-  };
-  await writeProviderSessionsFile(sessions);
+  await mutateProviderSessions((sessions) => {
+    assertCurrentSession();
+    sessions[payload.provider] = {
+      provider: payload.provider,
+      encryptedAccessToken: encryptToken(payload.accessToken),
+      encryptedRefreshToken: encryptToken(payload.refreshToken),
+      expiresAt: payload.expiresAt,
+      displayName: payload.displayName,
+      requiresPremium: payload.requiresPremium,
+      metadata: payload.metadata,
+      connectedAt,
+      storageMode: "local-secure"
+    };
+  });
+  assertCurrentSession();
+  volatileProviderSessions.set(payload.provider, volatileSession);
 
   return {
     storageMode: "local-secure",
@@ -2312,10 +2714,11 @@ async function persistLocalProviderSession(
 }
 
 async function clearLocalProviderSession(provider: Provider): Promise<void> {
+  providerSessionEpoch.set(provider, getProviderSessionEpoch(provider) + 1);
   volatileProviderSessions.delete(provider);
-  const sessions = await readProviderSessionsFile();
-  sessions[provider] = undefined;
-  await writeProviderSessionsFile(sessions);
+  await mutateProviderSessions((sessions) => {
+    sessions[provider] = undefined;
+  });
 
   if (provider === "soundcloud") {
     // Full sign-out: wipe AMP's OWN SoundCloud session (the persist:soundcloud partition the in-app
@@ -2323,6 +2726,8 @@ async function clearLocalProviderSession(provider: Provider): Promise<void> {
     // the next "Sign in to SoundCloud" would silently reuse the old account and you could never
     // switch accounts or see a fresh login.
     soundCloudOAuthToken = undefined;
+    providerGateway?.clearSoundCloudSession();
+    await clearDefaultSoundCloudOAuthCookies();
     if (soundCloudSignInWindow && !soundCloudSignInWindow.isDestroyed()) {
       soundCloudSignInWindow.close();
     }
@@ -2330,6 +2735,7 @@ async function clearLocalProviderSession(provider: Provider): Promise<void> {
       soundCloudLikeWindow.close();
     }
     await session.fromPartition(SOUNDCLOUD_LOCAL_PARTITION).clearStorageData().catch(() => undefined);
+    await clearSoundCloudResolverSession();
     // Also wipe the persistent system-browser login profile so a fresh sign-in / account switch
     // starts clean instead of silently re-reading the old account.
     await fs.rm(soundCloudLoginProfileDir(), { recursive: true, force: true }).catch(() => undefined);
@@ -2406,7 +2812,7 @@ function createStoredProviderRuntimeStatus(
       message:
         provider === "spotify"
           ? "Spotify sign-in needs SPOTIFY_CLIENT_ID in this build."
-          : "SoundCloud library sign-in needs bundled SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET in this standalone build. Public SoundCloud search and playback still work without sign-in."
+          : "SoundCloud API sign-in needs a client ID and secret configured in Settings. Public SoundCloud search and playback still work without it."
     };
   }
 
@@ -2473,7 +2879,10 @@ async function buildRuntimeInfo(): Promise<RuntimeInfo> {
 }
 
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, init);
+  const response = await fetch(input, {
+    ...init,
+    signal: init?.signal ?? AbortSignal.timeout(15_000)
+  });
   if (!response.ok) {
     throw await createHttpError(response, `Request failed with ${response.status}`);
   }
@@ -2573,7 +2982,7 @@ async function refreshSoundCloudProviderSession(refreshToken: string): Promise<P
   const clientSecret = process.env.SOUNDCLOUD_CLIENT_SECRET;
   if (!clientId || !clientSecret) {
     throw new Error(
-      "SoundCloud library sign-in is not configured in this standalone build. Bundle SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET so AMP can authorize entirely inside the desktop app. Public SoundCloud search and playback still work without sign-in."
+      "SoundCloud API sign-in is not configured. Add a client ID and secret in Settings, or use SoundCloud Local Connect. Public search and playback still work without it."
     );
   }
 
@@ -2665,8 +3074,9 @@ function refreshLocalProviderSession(provider: Provider): Promise<ProviderOAuthR
 }
 
 async function refreshLocalProviderSessionInner(provider: Provider): Promise<ProviderOAuthResult | null> {
+  const expectedEpoch = getProviderSessionEpoch(provider);
   const session = await readLocalProviderSession(provider);
-  if (!session) {
+  if (!session || getProviderSessionEpoch(provider) !== expectedEpoch) {
     return null;
   }
 
@@ -2713,7 +3123,13 @@ async function refreshLocalProviderSessionInner(provider: Provider): Promise<Pro
       ? await refreshSpotifyProviderSession(session.refreshToken)
       : await refreshSoundCloudProviderSession(session.refreshToken);
 
-  const persisted = await persistLocalProviderSession(refreshed, session.connectedAt);
+  if (getProviderSessionEpoch(provider) !== expectedEpoch) {
+    return null;
+  }
+  const persisted = await persistLocalProviderSession(refreshed, session.connectedAt, expectedEpoch);
+  if (getProviderSessionEpoch(provider) !== expectedEpoch) {
+    return null;
+  }
   return toProviderOAuthResult(
     refreshed,
     persisted.connectedAt,
@@ -2726,6 +3142,9 @@ async function refreshProviderSession(provider: Provider): Promise<ProviderOAuth
   try {
     return await refreshLocalProviderSession(provider);
   } catch (error) {
+    if (error instanceof StaleProviderSessionError) {
+      return null;
+    }
     const message = error instanceof Error ? error.message : String(error);
     // A revoked/expired refresh token is unrecoverable — clear the dead session so the app shows a
     // clean "reconnect" state instead of throwing on every refresh and skipping every track.
@@ -2748,6 +3167,8 @@ async function connectSpotify(): Promise<ProviderOAuthResult> {
   if (!clientId) {
     throw new Error("Spotify sign-in needs SPOTIFY_CLIENT_ID in this standalone build.");
   }
+  const expectedEpoch = getProviderSessionEpoch("spotify") + 1;
+  providerSessionEpoch.set("spotify", expectedEpoch);
 
   const verifier = createCodeVerifier();
   const challenge = createCodeChallenge(verifier);
@@ -2832,7 +3253,7 @@ async function connectSpotify(): Promise<ProviderOAuthResult> {
     }
   };
 
-  const persisted = await persistLocalProviderSession(payload);
+  const persisted = await persistLocalProviderSession(payload, undefined, expectedEpoch);
   return toProviderOAuthResult(payload, persisted.connectedAt, persisted.sessionSource, persisted.storageMode);
 }
 
@@ -2841,9 +3262,11 @@ async function connectSoundCloud(): Promise<ProviderOAuthResult> {
   const clientSecret = process.env.SOUNDCLOUD_CLIENT_SECRET;
   if (!clientId || !clientSecret) {
     throw new Error(
-      "SoundCloud library sign-in is not configured in this standalone build. Bundle SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET so AMP can authorize entirely inside the desktop app. Public SoundCloud search and playback still work without sign-in."
+      "SoundCloud API sign-in is not configured. Add a client ID and secret in Settings, or use SoundCloud Local Connect. Public search and playback still work without it."
     );
   }
+  const expectedEpoch = getProviderSessionEpoch("soundcloud") + 1;
+  providerSessionEpoch.set("soundcloud", expectedEpoch);
 
   const verifier = createCodeVerifier();
   const challenge = createCodeChallenge(verifier);
@@ -2900,7 +3323,7 @@ async function connectSoundCloud(): Promise<ProviderOAuthResult> {
     }
   };
 
-  const persisted = await persistLocalProviderSession(payload);
+  const persisted = await persistLocalProviderSession(payload, undefined, expectedEpoch);
   return toProviderOAuthResult(payload, persisted.connectedAt, persisted.sessionSource, persisted.storageMode);
 }
 
@@ -2916,7 +3339,7 @@ async function readSoundCloudWebToken(): Promise<string | undefined> {
     // Match the oauth_token cookie on any SoundCloud domain (with or without a leading dot).
     const cookies = await ses.cookies.get({ name: "oauth_token" });
     const raw = cookies
-      .filter((cookie) => /soundcloud\.com$/.test(cookie.domain ?? ""))
+      .filter((cookie) => /(^|\.)soundcloud\.com$/i.test(cookie.domain ?? ""))
       .map((cookie) => cookie.value)
       .find((value) => value && value.length > 8);
     return raw ? decodeURIComponent(raw) : undefined;
@@ -2929,6 +3352,9 @@ async function readSoundCloudWebToken(): Promise<string | undefined> {
 async function clearSoundCloudWebSession(): Promise<void> {
   try {
     await session.fromPartition(SOUNDCLOUD_WEB_PARTITION).clearStorageData();
+    await clearDefaultSoundCloudOAuthCookies();
+    providerGateway?.clearSoundCloudSession();
+    await clearSoundCloudResolverSession();
   } catch (error) {
     logStartup("soundcloud:web-signout-failed", error);
   }
@@ -2976,6 +3402,18 @@ async function setSoundCloudWebTrackLiked(request: SoundCloudTrackLikeRequest) {
 let soundCloudLikeWindow: BrowserWindow | undefined;
 let soundCloudLikeWindowReady: Promise<BrowserWindow> | undefined;
 
+function isTrustedSoundCloudPage(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    return (
+      url.protocol === "https:" &&
+      (url.hostname === "soundcloud.com" || url.hostname.endsWith(".soundcloud.com"))
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function ensureSoundCloudLikeWindow(): Promise<BrowserWindow> {
   if (soundCloudLikeWindow && !soundCloudLikeWindow.isDestroyed()) {
     return soundCloudLikeWindow;
@@ -3003,10 +3441,22 @@ async function ensureSoundCloudLikeWindow(): Promise<BrowserWindow> {
         soundCloudLikeWindow = undefined;
         soundCloudLikeWindowReady = undefined;
       });
+      win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+      const guardSoundCloudNavigation = (event: { preventDefault(): void }, url: string) => {
+        if (!isTrustedSoundCloudPage(url)) {
+          event.preventDefault();
+          logStartup("soundcloud:like:blocked-navigation");
+        }
+      };
+      win.webContents.on("will-navigate", guardSoundCloudNavigation);
+      win.webContents.on("will-redirect", guardSoundCloudNavigation);
       try {
         // Loading a real soundcloud.com page makes DataDome issue its cookie to this session (which
         // already holds the injected oauth_token), so subsequent in-page like fetches are trusted.
         await win.loadURL("https://soundcloud.com/discover");
+        if (!isTrustedSoundCloudPage(win.webContents.getURL())) {
+          throw new Error("SoundCloud sign-in window navigated to an untrusted page.");
+        }
       } catch (error) {
         // A failed load would otherwise cache this rejected promise forever (the window never
         // fires "closed"), permanently breaking likes until restart. Destroy + reset so the next
@@ -3060,26 +3510,32 @@ async function setSoundCloudLocalTrackLikedViaAppWindow(
     const win = await ensureSoundCloudLikeWindow();
     const method = request.liked ? "PUT" : "DELETE";
     const oauthToken = session.accessToken;
-    const pageUrl = win.webContents.getURL();
-    const script = `(async () => {
+    const scriptArguments = JSON.stringify({ oauthToken, clientId, numericId, method });
+    const script = `(async ({ oauthToken, clientId, numericId, method }) => {
       try {
-        const auth = { Authorization: 'OAuth ${oauthToken}' };
-        const meRes = await fetch('https://api-v2.soundcloud.com/me?client_id=${clientId}', { headers: auth, credentials: 'include' });
+        const auth = { Authorization: 'OAuth ' + oauthToken };
+        const meUrl = 'https://api-v2.soundcloud.com/me?client_id=' + encodeURIComponent(clientId);
+        const meRes = await fetch(meUrl, { headers: auth, credentials: 'include' });
         if (!meRes.ok) return { ok: false, stage: 'me', status: meRes.status, body: (await meRes.text()).slice(0, 300) };
         const me = await meRes.json();
         if (!me || !me.id) return { ok: false, stage: 'me', status: 0 };
-        const url = 'https://api-v2.soundcloud.com/users/' + me.id + '/track_likes/${numericId}?client_id=${clientId}';
-        const res = await fetch(url, { method: '${method}', headers: auth, credentials: 'include' });
+        const url = 'https://api-v2.soundcloud.com/users/' + encodeURIComponent(me.id) +
+          '/track_likes/' + encodeURIComponent(numericId) + '?client_id=' + encodeURIComponent(clientId);
+        const res = await fetch(url, { method, headers: auth, credentials: 'include' });
         const body = res.ok ? '' : (await res.text()).slice(0, 4000);
         return { ok: res.ok, stage: 'write', status: res.status, body };
       } catch (e) { return { ok: false, stage: 'error', status: 0, message: String(e) }; }
-    })()`;
+    })(${scriptArguments})`;
     type LikeResult = { ok: boolean; stage: string; status: number; message?: string; body?: string };
-    const exec = () => win.webContents.executeJavaScript(script) as Promise<LikeResult>;
+    const exec = () => {
+      if (win.isDestroyed() || !isTrustedSoundCloudPage(win.webContents.getURL())) {
+        throw new Error("SoundCloud like window is no longer on a trusted page.");
+      }
+      return win.webContents.executeJavaScript(script) as Promise<LikeResult>;
+    };
     const isCaptcha = (r: LikeResult) =>
       !r.ok && r.status === 403 && /captcha-delivery|datadome/i.test(r.body ?? "");
 
-    void pageUrl;
     logStartup(`soundcloud:like:window start track=${numericId} liked=${request.liked}`);
     let result = await exec();
 
@@ -3142,6 +3598,36 @@ async function setSoundCloudLocalTrackLikedViaAppWindow(
   }
 }
 
+function createStartupWindow(): BrowserWindow {
+  const window = new BrowserWindow({
+    title: "AMP",
+    width: 420,
+    height: 220,
+    show: true,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    frame: false,
+    center: true,
+    backgroundColor: "#0e1110",
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true
+    }
+  });
+  const html = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>AMP</title><style>html,body{height:100%;margin:0;background:#0e1110;color:#f4efe6;font-family:system-ui,sans-serif}body{display:grid;place-items:center}.card{text-align:center}.mark{font-size:38px;font-weight:800;letter-spacing:.16em}.status{margin-top:16px;color:#aaa096;font-size:13px;letter-spacing:.04em}</style><div class="card"><div class="mark">AMP</div><div class="status">Preparing secure playback...</div></div>`;
+  void window
+    .loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+    .catch((error) => {
+      if (!window.isDestroyed()) {
+        logStartup("startup-window:load-failed", error);
+      }
+    });
+  return window;
+}
+
 async function createMainWindow() {
   logStartup("createMainWindow:start");
   const preloadPath = path.join(moduleDirectory, "preload.cjs");
@@ -3174,7 +3660,7 @@ async function createMainWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       plugins: true,
-      sandbox: false,
+      sandbox: true,
       // AMP has no prose fields (just search/rename boxes), so the spellchecker only costs memory —
       // it lazy-loads a per-language dictionary (tens of MB) into the renderer. Off = leaner.
       spellcheck: false,
@@ -3211,7 +3697,16 @@ async function createMainWindow() {
   // which the renderer cannot tap any other way. The video track is a throwaway the renderer
   // stops immediately; no picker is shown and nothing is recorded.
   if (process.platform === "win32") {
-    window.webContents.session.setDisplayMediaRequestHandler((_request, callback) => {
+    window.webContents.session.setDisplayMediaRequestHandler((request, callback) => {
+      if (
+        request.frame !== window.webContents.mainFrame ||
+        !request.userGesture ||
+        !isTrustedMainWindowUrl(request.frame.url)
+      ) {
+        logStartup("display-media:blocked-untrusted-request");
+        callback({});
+        return;
+      }
       // thumbnailSize 0 skips the per-display screenshot getSources would otherwise grab on every
       // call. The renderer requests a ~1 fps tiny video and stops the track at once; we only want
       // the loopback AUDIO. (See audioReactor.ensureLoopback for why the video must stay minimal.)
@@ -3248,12 +3743,24 @@ async function createMainWindow() {
     return { action: "deny" };
   });
 
+  const guardMainFrameNavigation = (event: { preventDefault(): void }, url: string) => {
+    if (isTrustedMainWindowUrl(url)) {
+      return;
+    }
+    event.preventDefault();
+    void openAllowedExternalUrl(url);
+  };
+  window.webContents.on("will-navigate", guardMainFrameNavigation);
+  window.webContents.on("will-redirect", guardMainFrameNavigation);
+
   window.webContents.on("preload-error", (_event, preloadFile, error) => {
     logStartup(`createMainWindow:preload-error:${preloadFile}`, error);
   });
 
   window.webContents.on("console-message", (event) => {
-    logStartup(`renderer:console:${event.sourceId}:${event.lineNumber}`, event.message);
+    if (!app.isPackaged || event.level === "warning" || event.level === "error") {
+      logStartup(`renderer:console:${event.sourceId}:${event.lineNumber}`, event.message);
+    }
   });
 
   window.webContents.on("render-process-gone", (_event, details) => {
@@ -3311,12 +3818,9 @@ async function createMainWindow() {
   const actualOrigins = new Map<number, string>();
 
   window.webContents.session.webRequest.onBeforeSendHeaders((details, callback) => {
-    const isSc =
-      details.url.includes("playback.media-streaming.soundcloud.cloud") ||
-      details.url.includes("license.media-streaming.soundcloud.cloud") ||
-      details.url.includes("api-widget.soundcloud.com");
+    const soundCloudHost = getTrustedSoundCloudPlaybackHost(details.url);
 
-    if (isSc) {
+    if (soundCloudHost) {
       // Capture the real origin before we overwrite it.
       const actualOrigin =
         details.requestHeaders["Origin"] ||
@@ -3349,7 +3853,7 @@ async function createMainWindow() {
       // soundcloud.com, so neither crosses to soundcloud.cloud. The endpoint is gated solely by the
       // license_token in the query. Strip ALL cookies here to match the browser exactly; a leftover
       // oauth_token / datadome cookie is the prime 403 suspect.
-      if (details.url.includes("license.media-streaming.soundcloud.cloud")) {
+      if (soundCloudHost === "license.media-streaming.soundcloud.cloud") {
         for (const key of Object.keys(details.requestHeaders)) {
           if (key.toLowerCase() === "cookie") {
             delete details.requestHeaders[key];
@@ -3363,7 +3867,7 @@ async function createMainWindow() {
       // Conclusive on-wire header dump for the Widevine license endpoint so a still-403 attempt
       // is debuggable against the Safari FairPlay baseline (which sends only Origin/Referer/UA,
       // no Cookie/Authorization). Token values are redacted; only param names are logged.
-      if (details.url.includes("license.media-streaming.soundcloud.cloud")) {
+      if (soundCloudHost === "license.media-streaming.soundcloud.cloud") {
         const h = details.requestHeaders;
         const pick = (k: string): string =>
           String(h[k] ?? h[k.toLowerCase()] ?? "");
@@ -3384,11 +3888,8 @@ async function createMainWindow() {
   // Echo the real origin back in Access-Control-Allow-Origin so the browser's CORS
   // check passes regardless of whether the request came from our app or the widget iframe.
   window.webContents.session.webRequest.onHeadersReceived((details, callback) => {
-    const isSc =
-      details.url.includes("playback.media-streaming.soundcloud.cloud") ||
-      details.url.includes("license.media-streaming.soundcloud.cloud") ||
-      details.url.includes("api-widget.soundcloud.com");
-    if (isSc) {
+    const soundCloudHost = getTrustedSoundCloudPlaybackHost(details.url);
+    if (soundCloudHost) {
       const headers = details.responseHeaders || {};
       delete headers["access-control-allow-origin"];
       delete headers["Access-Control-Allow-Origin"];
@@ -3494,9 +3995,6 @@ app.whenReady().then(async () => {
     .initialize()
     .then(() => {
       logStartup("gateway:initialized");
-      // Clear stale SoundCloud stream cache on every launch — CDN URLs expire faster
-      // than the 20-minute TTL we used to use.
-      providerGateway?.invalidateProviderCache("soundcloud");
     })
     .catch((error) => logStartup("gateway:initialization-failed", error));
 
@@ -3506,22 +4004,42 @@ app.whenReady().then(async () => {
   // Warm the YouTube player host so the first YT play is instant.
   void ensureYouTubePlayerOrigin().catch((error) => logStartup("youtube-player:warm-failed", error));
 
+  // Show a lightweight non-EME window while castLabs installs or verifies the CDM. The main
+  // renderer still waits for readiness, but a cold/offline component check no longer looks like a
+  // failed launch.
+  const startupWindow = createStartupWindow();
+
   // castLabs ECS (electron-releases +wvcus) installs the Widevine CDM on demand through the
   // components service. It MUST be ready BEFORE the BrowserWindow loads any EME content, otherwise
   // the CDM initialises late/unverified — which makes the Spotify Web Playback SDK play only its
   // pre-buffered ~10s and then stall, and SoundCloud's monetized (ctr-encrypted-hls) tracks fail
   // to decrypt. Awaiting it here is the castLabs-documented requirement; the try/catch keeps a CDM
   // hiccup from blocking the whole app (components.whenReady can resolve slowly on first run).
+  const widevineInitialization = components
+    .whenReady()
+    .then(() => {
+      widevineReady = true;
+      widevineStatusText = JSON.stringify(components.status());
+      logStartup(`widevine:components-ready:${widevineStatusText}`);
+    })
+    .catch((error) => logStartup("widevine:components-failed", error));
   try {
-    await components.whenReady();
-    widevineReady = true;
-    widevineStatusText = JSON.stringify(components.status());
-    logStartup(`widevine:components-ready:${widevineStatusText}`);
-  } catch (error) {
-    logStartup("widevine:components-failed", error);
-  }
+    await Promise.race([
+      widevineInitialization,
+      new Promise<void>((resolve) => {
+        setTimeout(() => {
+          logStartup("widevine:components-timeout:continuing-degraded");
+          resolve();
+        }, 12_000);
+      })
+    ]);
 
-  await createMainWindow();
+    await createMainWindow();
+  } finally {
+    if (!startupWindow.isDestroyed()) {
+      startupWindow.destroy();
+    }
+  }
   createTray();
   registerMediaKeys();
 
@@ -3575,53 +4093,84 @@ process.on("unhandledRejection", (reason) => {
   logStartup("process:unhandledRejection", reason);
 });
 
-ipcMain.handle("spot-cloud:get-runtime-info", async () => buildRuntimeInfo());
+type IpcInvokeHandler = Parameters<typeof ipcMain.handle>[1];
+const rawIpcHandle = ipcMain.handle.bind(ipcMain);
 
-ipcMain.handle("spot-cloud:get-widevine-status", async () => ({
+function handleTrustedIpc(channel: string, listener: IpcInvokeHandler): void {
+  rawIpcHandle(channel, (event, ...args) => {
+    const senderFrame = event.senderFrame;
+    if (
+      !mainWindow ||
+      mainWindow.isDestroyed() ||
+      event.sender !== mainWindow.webContents ||
+      !senderFrame ||
+      senderFrame !== mainWindow.webContents.mainFrame ||
+      !isTrustedMainWindowUrl(senderFrame.url)
+    ) {
+      logStartup(`ipc:blocked-untrusted-sender:${channel}`);
+      throw new Error("IPC request denied.");
+    }
+    return listener(event, ...args);
+  });
+}
+
+function assertOAuthProvider(value: unknown): asserts value is Provider {
+  if (value !== "spotify" && value !== "soundcloud") {
+    throw new Error("Unsupported account provider.");
+  }
+}
+
+handleTrustedIpc("spot-cloud:get-runtime-info", async () => buildRuntimeInfo());
+
+handleTrustedIpc("spot-cloud:get-widevine-status", async () => ({
   ready: widevineReady,
   statusText: widevineStatusText
 }));
 
-ipcMain.handle("spot-cloud:reload-runtime", async () => {
+handleTrustedIpc("spot-cloud:reload-runtime", async () => {
   await reloadManagedDesktopEnv();
   return buildRuntimeInfo();
 });
 
-ipcMain.handle("spot-cloud:get-soundcloud-public-client-id", async () =>
+handleTrustedIpc("spot-cloud:get-soundcloud-public-client-id", async () =>
   getSoundCloudPublicClientId()
 );
 
-ipcMain.handle("spot-cloud:get-desktop-config", async () => readDesktopConfig());
+handleTrustedIpc("spot-cloud:get-desktop-config", async () => readDesktopConfig());
 
-ipcMain.handle("spot-cloud:save-desktop-config", async (_, config: DesktopConfig) => writeDesktopConfig(config));
+handleTrustedIpc("spot-cloud:save-desktop-config", async (_, config: unknown) =>
+  writeDesktopConfig(parseDesktopConfig(config))
+);
 
-ipcMain.handle("spot-cloud:open-config-directory", async () => {
+handleTrustedIpc("spot-cloud:open-config-directory", async () => {
   await fs.mkdir(app.getPath("userData"), { recursive: true });
   await shell.openPath(app.getPath("userData"));
   return true;
 });
 
-ipcMain.handle("spot-cloud:list-provider-sessions", async () => getStoredProviderSessionStatuses());
+handleTrustedIpc("spot-cloud:list-provider-sessions", async () => getStoredProviderSessionStatuses());
 
-ipcMain.handle("spot-cloud:clear-provider-session", async (_, provider: Provider) => {
+handleTrustedIpc("spot-cloud:clear-provider-session", async (_, provider: Provider) => {
+  assertOAuthProvider(provider);
   await clearLocalProviderSession(provider);
 });
 
-ipcMain.handle("spot-cloud:refresh-provider-session", async (_, request: OAuthRequest) => {
+handleTrustedIpc("spot-cloud:refresh-provider-session", async (_, request: OAuthRequest) => {
+  assertOAuthProvider(request?.provider);
   return refreshProviderSession(request.provider);
 });
 
-ipcMain.handle("spot-cloud:open-external", async (_, url: string) => {
+handleTrustedIpc("spot-cloud:open-external", async (_, url: string) => {
   return openAllowedExternalUrl(url);
 });
 
-ipcMain.handle("spot-cloud:resolve-artwork", async (_, request: ArtworkRequest) => {
+handleTrustedIpc("spot-cloud:resolve-artwork", async (_, request: ArtworkRequest) => {
   return resolveArtworkAsset(request);
 });
 
-ipcMain.handle("spot-cloud:get-window-state", async () => getDesktopWindowState());
+handleTrustedIpc("spot-cloud:get-window-state", async () => getDesktopWindowState());
 
-ipcMain.handle("spot-cloud:finish-startup-window", async () => {
+handleTrustedIpc("spot-cloud:finish-startup-window", async () => {
   mainWindowStartupComplete = true;
 
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -3634,13 +4183,13 @@ ipcMain.handle("spot-cloud:finish-startup-window", async () => {
   return getDesktopWindowState();
 });
 
-ipcMain.handle("spot-cloud:minimize-window", async () => {
+handleTrustedIpc("spot-cloud:minimize-window", async () => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.minimize();
   }
 });
 
-ipcMain.handle("spot-cloud:toggle-maximize-window", async () => {
+handleTrustedIpc("spot-cloud:toggle-maximize-window", async () => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     if (mainWindow.isMaximized()) {
       mainWindow.unmaximize();
@@ -3652,7 +4201,7 @@ ipcMain.handle("spot-cloud:toggle-maximize-window", async () => {
   return getDesktopWindowState();
 });
 
-ipcMain.handle("spot-cloud:close-window", async () => {
+handleTrustedIpc("spot-cloud:close-window", async () => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.close();
   }
@@ -3665,7 +4214,7 @@ let compactWasMaximized = false;
 // Explicit mode flag — inferring "already compact" from window properties (e.g. resizability)
 // breaks the moment any other feature toggles the same property.
 let isCompactMode = false;
-ipcMain.handle("spot-cloud:set-compact-mode", async (_, compact: boolean) => {
+handleTrustedIpc("spot-cloud:set-compact-mode", async (_, compact: boolean) => {
   const win = mainWindow;
   if (!win || win.isDestroyed()) {
     return { compact: false };
@@ -3708,7 +4257,7 @@ ipcMain.handle("spot-cloud:set-compact-mode", async (_, compact: boolean) => {
   return { compact };
 });
 
-ipcMain.handle("spot-cloud:open-devtools", async () => {
+handleTrustedIpc("spot-cloud:open-devtools", async () => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.openDevTools({ mode: "detach" });
   }
@@ -3781,7 +4330,8 @@ function registerWindowShortcuts(window: BrowserWindow): void {
   });
 }
 
-ipcMain.handle("spot-cloud:connect-provider", async (_, request: OAuthRequest) => {
+handleTrustedIpc("spot-cloud:connect-provider", async (_, request: OAuthRequest) => {
+  assertOAuthProvider(request?.provider);
   if (request.provider === "spotify") {
     return connectSpotify();
   }
@@ -3789,14 +4339,16 @@ ipcMain.handle("spot-cloud:connect-provider", async (_, request: OAuthRequest) =
   return connectSoundCloud();
 });
 
-ipcMain.handle("spot-cloud:cancel-connect-provider", (_, provider: Provider) => {
+handleTrustedIpc("spot-cloud:cancel-connect-provider", (_, provider: Provider) => {
+  assertOAuthProvider(provider);
+  providerSessionEpoch.set(provider, getProviderSessionEpoch(provider) + 1);
   // Aborts an in-flight sign-in wait if one exists; no-op otherwise. The wait resolves with the
   // cancel marker, so connectSpotify/connectSoundCloud reject and the renderer returns to idle.
   pendingAuthCancellers.get(provider)?.();
   return { ok: true };
 });
 
-ipcMain.handle("spot-cloud:gateway-request", async (_, request) => {
+handleTrustedIpc("spot-cloud:gateway-request", async (_, request) => {
   if (!providerGateway) {
     return { ok: false, error: "Provider gateway not initialized.", source: "fallback" };
   }
@@ -3824,11 +4376,11 @@ ipcMain.handle("spot-cloud:gateway-request", async (_, request) => {
 });
 
 // ── Local music ──────────────────────────────────────────────────────────────────────────────
-ipcMain.handle("spot-cloud:local-music-list-folders", async () => {
+handleTrustedIpc("spot-cloud:local-music-list-folders", async () => {
   return (await localMusicManager?.getFolders()) ?? [];
 });
 
-ipcMain.handle("spot-cloud:local-music-add-folder", async () => {
+handleTrustedIpc("spot-cloud:local-music-add-folder", async () => {
   // Open a native folder picker; returns the updated folder list (unchanged if cancelled).
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
   const result = parent
@@ -3840,11 +4392,11 @@ ipcMain.handle("spot-cloud:local-music-add-folder", async () => {
   return localMusicManager.addFolder(result.filePaths[0]);
 });
 
-ipcMain.handle("spot-cloud:local-music-remove-folder", async (_, folder: string) => {
+handleTrustedIpc("spot-cloud:local-music-remove-folder", async (_, folder: string) => {
   return (await localMusicManager?.removeFolder(folder)) ?? [];
 });
 
-ipcMain.handle("spot-cloud:local-music-scan", async () => {
+handleTrustedIpc("spot-cloud:local-music-scan", async () => {
   if (!localMusicManager) {
     return { ok: false, error: "Local music is not available.", tracks: [] as UnifiedTrack[] };
   }
@@ -3863,7 +4415,7 @@ ipcMain.handle("spot-cloud:local-music-scan", async () => {
 
 // The loopback origin hosting the YouTube IFrame player page. The renderer embeds it in a hidden
 // iframe (the YT player won't init from the file:// renderer origin, but works from http://127.0.0.1).
-ipcMain.handle("spot-cloud:youtube-player-origin", async () => {
+handleTrustedIpc("spot-cloud:youtube-player-origin", async () => {
   try {
     return await ensureYouTubePlayerOrigin();
   } catch (error) {
@@ -3872,7 +4424,7 @@ ipcMain.handle("spot-cloud:youtube-player-origin", async () => {
   }
 });
 
-ipcMain.handle("spot-cloud:get-anonymous-spotify-session", async () => {
+handleTrustedIpc("spot-cloud:get-anonymous-spotify-session", async () => {
   if (!providerGateway) {
     return undefined;
   }
@@ -3885,7 +4437,7 @@ ipcMain.handle("spot-cloud:get-anonymous-spotify-session", async () => {
 });
 
 // Silently re-load the library if a SoundCloud web session is already stored (no pop-up).
-ipcMain.handle("spot-cloud:soundcloud-web-reload", async () => {
+handleTrustedIpc("spot-cloud:soundcloud-web-reload", async () => {
   const token = await readSoundCloudWebToken();
   if (!token) {
     return { ok: false, error: "No stored SoundCloud session.", source: "internal" };
@@ -3893,20 +4445,20 @@ ipcMain.handle("spot-cloud:soundcloud-web-reload", async () => {
   return resolveSoundCloudWebLibrary(token);
 });
 
-ipcMain.handle("spot-cloud:soundcloud-web-has-session", async () => {
+handleTrustedIpc("spot-cloud:soundcloud-web-has-session", async () => {
   return Boolean(await readSoundCloudWebToken());
 });
 
-ipcMain.handle("spot-cloud:soundcloud-web-set-track-liked", async (_, request: SoundCloudTrackLikeRequest) => {
+handleTrustedIpc("spot-cloud:soundcloud-web-set-track-liked", async (_, request: SoundCloudTrackLikeRequest) => {
   return setSoundCloudWebTrackLiked(request);
 });
 
-ipcMain.handle("spot-cloud:soundcloud-web-signout", async () => {
+handleTrustedIpc("spot-cloud:soundcloud-web-signout", async () => {
   await clearSoundCloudWebSession();
   return { ok: true };
 });
 
-ipcMain.handle("spot-cloud:soundcloud-local-list-profiles", async () => {
+handleTrustedIpc("spot-cloud:soundcloud-local-list-profiles", async () => {
   try {
     return { ok: true, data: await listSoundCloudBrowserProfiles(), source: "internal" as const };
   } catch (error) {
@@ -3919,7 +4471,7 @@ ipcMain.handle("spot-cloud:soundcloud-local-list-profiles", async () => {
   }
 });
 
-ipcMain.handle("spot-cloud:soundcloud-local-connect", async (_, request: SoundCloudLocalConnectRequest) => {
+handleTrustedIpc("spot-cloud:soundcloud-local-connect", async (_, request: SoundCloudLocalConnectRequest) => {
   try {
     // `return await` (not bare `return`) so an async rejection is caught HERE and returned as
     // the { ok:false } shape the renderer expects, instead of rejecting its invoke promise.
@@ -3934,7 +4486,7 @@ ipcMain.handle("spot-cloud:soundcloud-local-connect", async (_, request: SoundCl
   }
 });
 
-ipcMain.handle("spot-cloud:soundcloud-local-open-signin", async (_, request: SoundCloudLocalConnectRequest) => {
+handleTrustedIpc("spot-cloud:soundcloud-local-open-signin", async (_, request: SoundCloudLocalConnectRequest) => {
   try {
     const profiles = await listSoundCloudBrowserProfiles();
     const selectedProfile = profiles.find((profile) => profile.id === request.profileId);
@@ -3953,7 +4505,7 @@ ipcMain.handle("spot-cloud:soundcloud-local-open-signin", async (_, request: Sou
   }
 });
 
-ipcMain.handle("spot-cloud:soundcloud-local-close-browser", async (_, request: SoundCloudLocalConnectRequest) => {
+handleTrustedIpc("spot-cloud:soundcloud-local-close-browser", async (_, request: SoundCloudLocalConnectRequest) => {
   try {
     const profiles = await listSoundCloudBrowserProfiles();
     const selectedProfile = profiles.find((profile) => profile.id === request.profileId);
@@ -3972,7 +4524,7 @@ ipcMain.handle("spot-cloud:soundcloud-local-close-browser", async (_, request: S
   }
 });
 
-ipcMain.handle("spot-cloud:download-soundcloud-track", async (_, request: { track: UnifiedTrack }) => {
+handleTrustedIpc("spot-cloud:download-soundcloud-track", async (_, request: { track: UnifiedTrack }) => {
   try {
     const result = await downloadSoundCloudTrack(request.track);
     if (result.ok && result.path) {
@@ -3986,7 +4538,7 @@ ipcMain.handle("spot-cloud:download-soundcloud-track", async (_, request: { trac
   }
 });
 
-ipcMain.handle("spot-cloud:soundcloud-system-browser-signin", async () => {
+handleTrustedIpc("spot-cloud:soundcloud-system-browser-signin", async () => {
   try {
     return await signInSoundCloudViaSystemBrowser();
   } catch (error) {
@@ -3999,7 +4551,7 @@ ipcMain.handle("spot-cloud:soundcloud-system-browser-signin", async () => {
   }
 });
 
-ipcMain.handle("spot-cloud:soundcloud-in-app-signin", async () => {
+handleTrustedIpc("spot-cloud:soundcloud-in-app-signin", async () => {
   try {
     return await signInSoundCloudInApp();
   } catch (error) {
@@ -4012,24 +4564,20 @@ ipcMain.handle("spot-cloud:soundcloud-in-app-signin", async () => {
   }
 });
 
-ipcMain.handle("spot-cloud:soundcloud-local-set-track-liked", async (_, request: SoundCloudTrackLikeRequest) => {
+handleTrustedIpc("spot-cloud:soundcloud-local-set-track-liked", async (_, request: SoundCloudTrackLikeRequest) => {
   return setSoundCloudLocalTrackLiked(request);
 });
 
-ipcMain.handle("spot-cloud:widevine-node-license", async (_, request) => {
-  return acquireLicenseWithNodeSession(request);
-});
-
-ipcMain.handle("spot-cloud:set-discord-presence", (_, payload: DiscordPresencePayload | null) => {
+handleTrustedIpc("spot-cloud:set-discord-presence", (_, payload: unknown) => {
   if (!discordPresenceEnabled) {
     // setActivity() on a stopped client would re-arm connection attempts — refuse while disabled.
     return { ok: false };
   }
-  discordPresence.setActivity(discordActivityFromPayload(payload));
+  discordPresence.setActivity(discordActivityFromPayload(parseDiscordPresencePayload(payload)));
   return { ok: true };
 });
 
-ipcMain.handle("spot-cloud:set-discord-presence-enabled", (_, enabled: boolean) => {
+handleTrustedIpc("spot-cloud:set-discord-presence-enabled", (_, enabled: boolean) => {
   discordPresenceEnabled = enabled === true;
   if (discordPresenceEnabled) {
     discordPresence.start(getDiscordClientId());

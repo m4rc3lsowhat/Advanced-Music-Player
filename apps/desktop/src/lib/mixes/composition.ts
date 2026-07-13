@@ -272,6 +272,20 @@ export function crossProviderKey(track: UnifiedTrack): string {
   return `${normalizeTitle(track.title)}::${normalizeArtist(primaryArtist(track))}`;
 }
 
+/** Local calendar date used to keep Daily Mix rollover aligned with the listener's midnight. */
+export function localDateKey(date = new Date()): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/** Stable signature for the provider-agnostic songs that currently seed Daily Mixes. */
+export function libraryMixFingerprint(tracks: UnifiedTrack[]): string {
+  const keys = [...new Set(tracks.map(crossProviderKey))].sort();
+  return `${keys.length}:${hashString(keys.join("\u001f")).toString(36)}`;
+}
+
 // ---- Script / language detection (for the station language gate) ----
 
 export type ScriptTag =
@@ -604,7 +618,9 @@ export function buildScoredStation(
   options: StationOptions
 ): HomeMix {
   const seedKey = options.seedKey ?? trackKey(seed);
-  const pool = candidates.filter((track) => trackKey(track) !== trackKey(seed));
+  const pool = candidates.filter(
+    (track) => trackKey(track) !== trackKey(seed) && (scores.get(trackKey(track)) ?? 0) >= 0
+  );
   const ordered = orderStationTracks(pool, scores, seedKey, Math.max(0, options.size - 1));
   const tracks = dedupeTracks([seed, ...ordered]).slice(0, options.size);
 

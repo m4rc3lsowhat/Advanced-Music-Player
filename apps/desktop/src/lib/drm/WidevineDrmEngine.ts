@@ -54,7 +54,7 @@ export type DrmEngineEvent =
   | { type: "cdm-message"; messageType: MediaKeyMessageType; size: number; certInstalled: boolean }
   | { type: "license-request"; url: string }
   | { type: "license-ok"; size: number }
-  | { type: "license-failed"; status: number; body: string }
+  | { type: "license-failed"; status: number }
   | { type: "session-update-ok" }
   | { type: "session-update-failed"; error: string }
   | { type: "error"; phase: string; error: string };
@@ -269,7 +269,7 @@ export class WidevineDrmEngine {
       "Content-Type": "application/octet-stream"
     };
 
-    this.emit({ type: "license-request", url: url.toString() });
+    this.emit({ type: "license-request", url: `${url.origin}${url.pathname}` });
 
     const response = await fetch(url.toString(), {
       method: "POST",
@@ -282,9 +282,8 @@ export class WidevineDrmEngine {
     const contentType = response.headers.get("content-type") || "";
 
     if (!response.ok) {
-      const body = await response.text();
-      this.emit({ type: "license-failed", status: response.status, body: body.slice(0, 500) });
-      throw new Error(`License server ${response.status}: ${body.slice(0, 200)}`);
+      this.emit({ type: "license-failed", status: response.status });
+      throw new Error(`License server returned ${response.status}.`);
     }
 
     const license = await response.arrayBuffer();

@@ -24,6 +24,29 @@ let captureInstalled = false;
 /** The native DataDome client-id, captured from the SoundCloud app's own api-v2 requests. */
 let capturedDatadomeClientId: string | undefined;
 
+function isTrustedSoundCloudUrl(rawUrl: string, apiOnly = false): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "https:") return false;
+    if (apiOnly) return url.hostname === "api-v2.soundcloud.com";
+    return url.hostname === "soundcloud.com" || url.hostname.endsWith(".soundcloud.com");
+  } catch {
+    return false;
+  }
+}
+
+function guardSoundCloudWindow(win: BrowserWindow): void {
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  const guard = (event: { preventDefault(): void }, url: string) => {
+    if (!isTrustedSoundCloudUrl(url)) {
+      event.preventDefault();
+      log("blocked navigation outside SoundCloud");
+    }
+  };
+  win.webContents.on("will-navigate", guard);
+  win.webContents.on("will-redirect", guard);
+}
+
 function log(message: string, ...rest: unknown[]): void {
   console.log(`[SC Resolver] ${message}`, ...rest);
 }
@@ -127,6 +150,7 @@ async function ensureWindow(oauthToken?: string): Promise<BrowserWindow> {
         backgroundThrottling: false
       }
     });
+    guardSoundCloudWindow(win);
     win.webContents.setAudioMuted(true);
     log("loading soundcloud.com in hidden window…");
     await win.loadURL(SOUNDCLOUD_HOME).catch((error) => log("loadURL error", error));
@@ -152,7 +176,13 @@ export async function resolveMediaInPage(opts: {
   url: string;
   oauthToken: string;
 }): Promise<InPageResponse> {
+  if (!isTrustedSoundCloudUrl(opts.url, true)) {
+    throw new Error("SoundCloud returned an untrusted media URL.");
+  }
   const win = await ensureWindow(opts.oauthToken);
+  if (!isTrustedSoundCloudUrl(win.webContents.getURL())) {
+    throw new Error("SoundCloud resolver window left its trusted origin.");
+  }
   const headers: Record<string, string> = { Authorization: `OAuth ${opts.oauthToken}` };
   if (capturedDatadomeClientId) {
     headers["x-datadome-clientid"] = capturedDatadomeClientId;
@@ -193,7 +223,7 @@ export async function probeNativePlaybackOnce(
   trackUrl: string | undefined,
   oauthToken: string
 ): Promise<void> {
-  if (probeStarted || !trackUrl) return;
+  if (probeStarted || !trackUrl || !isTrustedSoundCloudUrl(trackUrl)) return;
   probeStarted = true;
   try {
     const ses = session.fromPartition(RESOLVER_PARTITION);
@@ -211,6 +241,7 @@ export async function probeNativePlaybackOnce(
         backgroundThrottling: false
       }
     });
+    guardSoundCloudWindow(win);
     win.webContents.setAudioMuted(true);
     log(`PROBE: opening real track page ${trackUrl}`);
     await win.loadURL(trackUrl).catch((error) => log("PROBE loadURL error", error));
@@ -239,4 +270,18 @@ export async function probeNativePlaybackOnce(
 /** True once a hidden resolver window exists (for diagnostics). */
 export function isResolverWindowReady(): boolean {
   return windowPromise !== null;
+}
+
+/** Destroy the authenticated resolver context and remove its persistent cookies on sign-out. */
+export async function clearSoundCloudResolverSession(): Promise<void> {
+  const pendingWindow = windowPromise;
+  windowPromise = null;
+  capturedDatadomeClientId = undefined;
+  probeStarted = false;
+
+  const win = await pendingWindow?.catch(() => null);
+  if (win && !win.isDestroyed()) {
+    win.destroy();
+  }
+  await session.fromPartition(RESOLVER_PARTITION).clearStorageData().catch(() => undefined);
 }

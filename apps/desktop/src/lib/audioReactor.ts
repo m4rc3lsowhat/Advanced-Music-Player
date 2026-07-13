@@ -19,7 +19,7 @@
  * If loopback isn't available the reactor never fires and the UI keeps the static artwork tint.
  */
 
-const FLUX_WINDOW = 48; // ~0.8 s of flux history at 60 fps — adapts to the song's own dynamics
+const FLUX_WINDOW = 27; // ~0.8 s at the reactor's 33 fps sampling rate
 const BEAT_DECAY_TAU_MS = 170; // beat pulse half-life feel: punchy but not strobing
 const BEAT_REFRACTORY_MS = 160; // ignore re-triggers faster than ~375 BPM
 const ENERGY_ATTACK = 0.35;
@@ -34,6 +34,7 @@ export class AudioReactor {
   private loopbackStream: MediaStream | null = null;
   private loopbackFailed = false;
   private acquiringLoopback: Promise<boolean> | null = null;
+  private acquisitionGeneration = 0;
 
   private freq: Uint8Array<ArrayBuffer> | null = null;
   private raf = 0;
@@ -100,11 +101,14 @@ export class AudioReactor {
 
   /** Fully release the system-audio capture (leaving audio mode). Allows a fresh retry later. */
   releaseLoopback(): void {
-    this.loopbackStream?.getTracks().forEach((track) => track.stop());
+    this.acquisitionGeneration += 1;
+    const stream = this.loopbackStream;
     this.loopbackStream = null;
     this.loopbackAnalyser = null;
-    void this.loopbackCtx?.close().catch(() => undefined);
+    stream?.getTracks().forEach((track) => track.stop());
+    const context = this.loopbackCtx;
     this.loopbackCtx = null;
+    void context?.close().catch(() => undefined);
     this.loopbackFailed = false;
   }
 
@@ -118,6 +122,7 @@ export class AudioReactor {
     if (this.acquiringLoopback) {
       return this.acquiringLoopback;
     }
+    const generation = this.acquisitionGeneration;
     this.acquiringLoopback = (async () => {
       try {
         // getDisplayMedia REQUIRES a video request, and electron's loopback grant binds the audio to
@@ -133,6 +138,10 @@ export class AudioReactor {
           // the request being rejected, which would kill loopback entirely — so we don't set them.)
           video: { frameRate: { ideal: 1, max: 3 } }
         });
+        if (generation !== this.acquisitionGeneration) {
+          stream.getTracks().forEach((track) => track.stop());
+          return false;
+        }
         stream.getVideoTracks().forEach((track) => track.stop());
         if (stream.getAudioTracks().length === 0) {
           stream.getTracks().forEach((track) => track.stop());
@@ -150,9 +159,20 @@ export class AudioReactor {
         this.loopbackStream = stream;
         this.loopbackCtx = ctx;
         this.loopbackAnalyser = analyser;
+        stream.getAudioTracks()[0]?.addEventListener(
+          "ended",
+          () => {
+            if (this.loopbackStream === stream) {
+              this.releaseLoopback();
+            }
+          },
+          { once: true }
+        );
         return true;
       } catch {
-        this.loopbackFailed = true;
+        if (generation === this.acquisitionGeneration) {
+          this.loopbackFailed = true;
+        }
         return false;
       } finally {
         this.acquiringLoopback = null;
@@ -174,7 +194,6 @@ export class AudioReactor {
     }
 
     if (!this.loopbackAnalyser) {
-      void this.ensureLoopback();
       return;
     }
     if (this.loopbackCtx?.state === "suspended") {
@@ -194,13 +213,16 @@ export class AudioReactor {
 
     // Band energies. fftSize 1024 at 44.1/48 kHz ≈ 43–47 Hz per bin: bins 1–4 cover the kick
     // range (~45–190 Hz); the overall level ignores the hiss above ~8 kHz.
+    const binHz = (this.loopbackCtx?.sampleRate ?? 48_000) / analyser.fftSize;
+    const bassStart = Math.max(1, Math.ceil(45 / binHz));
+    const bassEnd = Math.min(bins - 1, Math.floor(190 / binHz));
     let bass = 0;
-    for (let i = 1; i <= 4; i += 1) {
+    for (let i = bassStart; i <= bassEnd; i += 1) {
       bass += this.freq[i];
     }
-    bass /= 4 * 255;
+    bass /= Math.max(1, bassEnd - bassStart + 1) * 255;
 
-    const upper = Math.min(bins, 186);
+    const upper = Math.min(bins, Math.max(2, Math.floor(8_000 / binHz)));
     let total = 0;
     for (let i = 1; i < upper; i += 1) {
       total += this.freq[i];

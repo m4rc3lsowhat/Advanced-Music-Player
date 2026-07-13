@@ -16,6 +16,10 @@ on:
 permissions:
   contents: write # needed to create the draft release and upload the installer
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   windows-installer:
     name: Windows installer
@@ -26,16 +30,17 @@ jobs:
       # users can configure their own credentials in-app.
       SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
       SOUNDCLOUD_CLIENT_ID: ${{ secrets.SOUNDCLOUD_CLIENT_ID }}
-      SOUNDCLOUD_CLIENT_SECRET: ${{ secrets.SOUNDCLOUD_CLIENT_SECRET }}
       DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: "22.18.0"
 
       - name: Enable Corepack (activates the pinned pnpm@10.11.0)
         shell: bash
@@ -69,6 +74,10 @@ jobs:
             echo "sign=true" >> "$GITHUB_OUTPUT"
             echo "VMP signing: ON — DRM-protected SoundCloud tracks will play in this build."
           else
+            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+              echo "::error::Tagged releases require EVS_ACCOUNT_NAME and VMP signing." >&2
+              exit 1
+            fi
             echo "sign=false" >> "$GITHUB_OUTPUT"
             echo "::warning::VMP signing OFF (no EVS_ACCOUNT_NAME secret)." \
                  "Everything works except DRM-protected SoundCloud tracks (those need a signed build)."
@@ -90,6 +99,10 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: corepack pnpm install --frozen-lockfile
+
+      - name: Verify source
+        shell: bash
+        run: corepack pnpm verify
 
       - name: Build installer
         shell: bash
@@ -121,14 +134,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Non-destructive: if a release for this tag already exists (e.g. one cut by hand),
-          # leave it and its assets alone instead of failing or clobbering a signed installer.
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            echo "Release ${GITHUB_REF_NAME} already exists — leaving it and its assets untouched."
-          else
-            gh release create "${GITHUB_REF_NAME}" \
-              --draft \
-              --title "AMP ${GITHUB_REF_NAME}" \
-              --generate-notes \
-              apps/desktop/dist/*.exe
+            is_draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq .isDraft)"
+            if [ "${is_draft}" != "true" ]; then
+              echo "::error::Release ${GITHUB_REF_NAME} is already published; refusing to replace its assets." >&2
+              exit 1
+            fi
+            gh release upload "${GITHUB_REF_NAME}" apps/desktop/dist/*.exe --clobber
+            exit 0
           fi
+
+          # No release exists yet, so create the canonical draft and attach the installer.
+          gh release create "${GITHUB_REF_NAME}" \
+            --draft \
+            --title "AMP ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            apps/desktop/dist/*.exe

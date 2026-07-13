@@ -5,10 +5,12 @@ Quick ways to start the app.
 | You're on | Do this |
 |-----------|---------|
 | **Windows** | Double-click **`bin/amp.cmd`** |
-| **macOS / Linux** | Run **`bin/amp.sh`** (`chmod +x bin/amp.sh` once) |
-| **Any terminal** | From the project root: `pnpm start` |
+| **macOS** | Run **`bin/amp.sh`** (`chmod +x bin/amp.sh` once) |
+| **Linux** | From the project root: `corepack pnpm dev` |
+| **Any development terminal** | From the project root: `corepack pnpm dev` |
 
-The first launch builds the app (about a minute); after that it opens instantly.
+The Windows and macOS launchers build the packaged app when it is missing. The development command
+starts Vite and Electron directly.
 
 ## Other helpers
 

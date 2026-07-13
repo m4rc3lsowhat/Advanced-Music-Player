@@ -38,6 +38,7 @@ interface DesktopConfig {
   spotifyClientId: string;
   soundCloudClientId: string;
   soundCloudClientSecret: string;
+  soundCloudClientSecretConfigured: boolean;
 }
 
 interface StoredProviderSessionStatus {
@@ -178,20 +179,6 @@ interface SpotCloudBridge {
     cancelConnect(provider: Provider): Promise<{ ok: boolean }>;
   };
   drm: {
-    widevineNodeLicense(request: {
-      psshBase64: string;
-      licenseUrl: string;
-      licenseAuthToken?: string;
-      privateKeyPath: string;
-      identifierBlobPath: string;
-    }): Promise<{
-      ok: boolean;
-      status: number;
-      keyCount: number;
-      keys?: Array<{ key: string; type: string; kid?: string }>;
-      error?: string;
-      serviceCertOk: boolean;
-    }>;
     getWidevineStatus(): Promise<{ ready: boolean; statusText: string }>;
   };
 }

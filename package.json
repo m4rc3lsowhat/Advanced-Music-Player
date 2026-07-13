@@ -3,15 +3,32 @@
   "private": true,
   "version": "0.3.2",
   "packageManager": "pnpm@10.11.0",
+  "engines": {
+    "node": ">=22.18.0 <26"
+  },
   "scripts": {
     "dev": "corepack pnpm --filter @amp/desktop dev",
     "build": "corepack pnpm --filter @amp/desktop build",
     "start": "corepack pnpm --filter @amp/desktop exec electron .",
     "typecheck": "corepack pnpm --filter @amp/desktop typecheck",
+    "test": "node packages/core/run-advance-test.mjs && node apps/desktop/scripts/run-feature-tests.mjs && node apps/desktop/scripts/run-mix-composition-tests.mjs && node apps/desktop/scripts/run-playback-guard-tests.mjs && node apps/desktop/scripts/run-captcha-tests.mjs && node apps/desktop/scripts/run-remote-like-tests.mjs",
+    "verify": "corepack pnpm test && corepack pnpm typecheck && corepack pnpm build",
+    "audit": "corepack pnpm audit",
+    "audit:prod": "corepack pnpm audit --prod",
     "smoke": "corepack pnpm --filter @amp/desktop smoke",
     "dist": "corepack pnpm --filter @amp/desktop dist"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["electron", "electron-winstaller"]
+    "onlyBuiltDependencies": ["electron", "electron-winstaller"],
+    "overrides": {
+      "brace-expansion": "^5.0.6",
+      "dmg-builder": "26.15.3",
+      "electron-builder-squirrel-windows": "26.15.3",
+      "form-data": "^4.0.6",
+      "js-yaml": "^4.2.0",
+      "tar": "^7.5.16",
+      "tmp": "^0.2.6",
+      "undici": "^6.27.0"
+    }
   }
 }

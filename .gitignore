@@ -1,0 +1,20 @@
+node_modules
+dist
+dist-electron
+.vite
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+coverage
+.turbo
+apps/desktop/release/
+apps/desktop/release-standalone/
+electron-smoke.log
+*.log
+packages/core/.advtest/
+*.tsbuildinfo
+
+# Local planning/session state
+.superpowers/

@@ -209,6 +209,67 @@ try {
 
     assert(engine.getState().currentIndex === 1, "overlapping playAt should leave newest index active");
     assert(engine.getState().queue[engine.getState().currentIndex]?.id === second.id, "newest track should remain active");
+    assert(spotify.current?.id === second.id, "same-provider overlap should leave the adapter on the newest track");
+  }
+
+  async function testPauseCancelsInflightPlay() {
+    let releasePlay;
+    const playDelay = new Promise((resolve) => {
+      releasePlay = resolve;
+    });
+    const spotify = new MockAdapter("spotify");
+    spotify.playDelays.push(playDelay);
+    const engine = new QueueEngine([spotify]);
+    const track = makeTrack(0, "spotify");
+
+    engine.setQueue([track], 0);
+    const pendingPlay = engine.playAt(0);
+    await tick();
+    await engine.pause();
+    releasePlay();
+    await pendingPlay;
+    await tick();
+
+    assert(engine.getState().status === "paused", "pause should win over an in-flight play");
+  }
+
+  async function testRemovingInflightTailCannotResumeRemovedTrack() {
+    let releasePlay;
+    const playDelay = new Promise((resolve) => {
+      releasePlay = resolve;
+    });
+    const spotify = new MockAdapter("spotify");
+    const soundcloud = new MockAdapter("soundcloud");
+    spotify.playDelays.push(playDelay);
+    const engine = new QueueEngine([spotify, soundcloud]);
+    const first = makeTrack(0, "soundcloud");
+    const tail = makeTrack(1, "spotify");
+
+    engine.setQueue([first, tail], 1);
+    const pendingPlay = engine.playAt(1);
+    await tick();
+    engine.removeAt(1);
+    releasePlay();
+    await pendingPlay;
+    await tick();
+
+    assert(engine.getState().queue.length === 1, "removing the tail should keep only the prior track");
+    assert(engine.getState().status === "paused", "removed in-flight tail should leave the queue paused");
+    assert(engine.getState().activeProvider === "soundcloud", "removing the tail should select the remaining provider");
+    assert(spotify.current?.id !== tail.id, "removed in-flight tail must not resume after its play resolves");
+  }
+
+  async function testManualNextAtTailIsNoOp() {
+    const spotify = new MockAdapter("spotify");
+    const engine = new QueueEngine([spotify]);
+    const track = makeTrack(0, "spotify");
+
+    engine.setQueue([track], 0);
+    await engine.playAt(0);
+    await engine.next();
+
+    assert(engine.getState().status === "playing", "manual next at the tail should not fake a pause");
+    assert(spotify.current?.id === track.id, "manual next at the tail should keep current audio");
   }
 
   async function testFailedTrackSkipsForward() {
@@ -300,6 +361,9 @@ try {
   await testLongMixedAutoAdvance();
   await testStaleSameProviderEventsIgnored();
   await testOverlappingSameProviderPlayKeepsNewest();
+  await testPauseCancelsInflightPlay();
+  await testRemovingInflightTailCannotResumeRemovedTrack();
+  await testManualNextAtTailIsNoOp();
   await testFailedTrackSkipsForward();
   await testQueueCanStartAtMiddleIndex();
   testReshuffleUpcomingKeepsCurrentAndHistory();

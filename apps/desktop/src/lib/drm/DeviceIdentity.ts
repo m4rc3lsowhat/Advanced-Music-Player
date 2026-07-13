@@ -22,37 +22,25 @@
 type PersistFn = (key: string, value: string) => Promise<void> | void;
 type RetrieveFn = (key: string) => Promise<string | null | undefined> | string | null | undefined;
 
-/** Browser-safe random bytes using Web Crypto, falling back to node:crypto in Electron. */
+/** Browser-safe random bytes using Web Crypto. */
 async function getRandomBytes(length: number): Promise<Uint8Array> {
-  try {
-    const crypto = globalThis.crypto;
-    if (crypto?.getRandomValues) {
-      return crypto.getRandomValues(new Uint8Array(length));
-    }
-  } catch {
-    // ignore
+  const webCrypto = globalThis.crypto;
+  if (!webCrypto?.getRandomValues) {
+    throw new Error("Secure random number generation is unavailable.");
   }
-  // Electron / Node fallback
-  const { randomBytes } = await import("node:crypto");
-  return new Uint8Array(randomBytes(length));
+  return webCrypto.getRandomValues(new Uint8Array(length));
 }
 
 /** Browser-safe SHA-256 digest returning hex string. */
 async function sha256Hex(data: Uint8Array): Promise<string> {
-  try {
-    const crypto = globalThis.crypto;
-    if (crypto?.subtle) {
-      const hash = await crypto.subtle.digest("SHA-256", data as BufferSource);
-      return Array.from(new Uint8Array(hash))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-    }
-  } catch {
-    // ignore
+  const webCrypto = globalThis.crypto;
+  if (!webCrypto?.subtle) {
+    throw new Error("Secure hashing is unavailable.");
   }
-  // Electron / Node fallback
-  const { createHash } = await import("node:crypto");
-  return createHash("sha256").update(Buffer.from(data)).digest("hex");
+  const hash = await webCrypto.subtle.digest("SHA-256", data as BufferSource);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 interface DeviceIdentityPayload {
@@ -127,7 +115,7 @@ class DeviceIdentityManager {
 
   private async generateNew(): Promise<DeviceIdentity> {
     const entropy = await getRandomBytes(32);
-    const deviceId = crypto.randomUUID?.() ?? (await this.fallbackUuid());
+    const deviceId = globalThis.crypto.randomUUID?.() ?? (await this.fallbackUuid());
     const fingerprint = (await sha256Hex(entropy)).slice(0, 16);
     return {
       deviceId,
